@@ -1,0 +1,648 @@
+---
+title: "CM_shotgun_Entamoeba_RFC_Rmd"
+author: "MAR"
+date: "4/10/2019"
+output: html_document
+---
+---
+title: "CM_shotgun_lactose_RFC.Rmd"
+author: "MAR"
+date: "4/10/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dev='svg'
+)
+```
+
+```{r Libraries, include=FALSE}
+library("tidyverse")
+library("magrittr")
+library("taxonomizr")
+library("reshape2")
+library("ggplot2")
+library("eclectic")
+library("pander")
+library("vegan")
+library("ape")
+library("scales")
+library("randomForest")
+library("plyr")
+library("caret")
+library("rfUtilities")
+library("ggplot2")
+library("ggbeeswarm")
+library("tidyr")
+library("readr")
+library("qiimer")
+library("doParallel")
+library("e1071")
+```
+
+This is an R Markdown that summarizes k-mer based classification of shotgun metagenomic reads. Specifically, shotgun reads from Cameroonian fecal samples were analyzed by [Kraken Uniq](https://github.com/fbreitwieser/krakenuniq) using the database of bacterial, archaeal, viral, protozoan, fungal, and helminth sequences downloaded from NCBI nr/nt collection by Arwa in December 2018. This workflow was done using [sunbeam](https://github.com/sunbeam-labs/sunbeam) using the [Kraken Uniq extension](https://github.com/ArwaAbbas/sbx_kraken_uniq).
+
+The output is tab-delimited, with one line per taxon. The fields of the output,from left-to-right,are as follows:  
+
+Percentage of reads covered by the clade rooted at this taxon  
+Number of reads covered by the clade rooted at this taxon  
+Number of reads assigned directly to this taxon  
+Rank code reporting all 27 ranks defined in the NCBI taxonomy.
+NCBI taxonomy ID  
+Indented scientific name
+
+The output file of KrakenUniq report file is identical to Kraken. The report file has a couple of modifications - namely a header and three additional columns:  
+kmers: number of unique k-mers  
+dup: average number of times each unique k-mer has been seen  
+cov: coverage of the k-mers of the clade in the database
+
+#Functions and themes 
+```{r Read Kraken files}
+read_kraken_files <- function(filename) {
+                              x = read.delim(filename, comment.char="#",
+                                             stringsAsFactors = FALSE)
+                              samplename = gsub("-reports.tsv", "",filename)
+                              x$V10 = samplename
+                              return(x)
+}
+```
+
+```{r Add noise/generate pos control in RFC data}
+#A standard deviation of 1 will give you a fairly correlated feature, s.d. of 0.3 will give you a highly correlated feature, and s.d. of 3 will give you an uncorrelated feature.
+
+add_noise <- function (x, sd=1) {
+  as.numeric(x) + rnorm(length(x), sd = sd)
+}
+```
+```{r Remove features that are non-zero less than a specified proportion of the time}
+
+remove_rare <- function( table , cutoff_pro ) {
+  row2keep <- c()
+  cutoff <- ceiling( cutoff_pro * ncol(table) )  
+  for ( i in 1:nrow(table) ) {
+    row_nonzero <- length( which( table[ i , ]  > 0 ) ) 
+    if ( row_nonzero > cutoff ) {
+      row2keep <- c( row2keep , i)
+    }
+  }
+  return( table [ row2keep , , drop=F ])
+}
+```
+
+```{r Plotting}
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Heatmap
+theme_aa_heatmap <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        strip.background.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+#Barchart
+theme_aa_bars <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+#Scatterplot
+theme_aa_scatter <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+
+#Kind of crazy, but these need to be in the exact same order as they would be as factors in the dataframe.
+ethnic_cols <-c("Bagyeli" = "#a9315c",
+                "Baka" = "#f58aa5",
+                "Bantu" = "#ffcc99", 
+                "Mbororo_Fulani" = "#999FFF")
+ANTS_shapes <- c("Neg" = 2,
+                 "Pos" = 17)
+
+```
+
+#Import data
+```{r Set up Taxonomizr, message=FALSE, include=FALSE, cache = TRUE}
+#Set up Taxonomizer databases from a shared site if it doesn't already exist.
+#This takes a while
+
+if(!exists("taxaNodes")) 
+   taxaNodes<-read.nodes('/media/lorax/projects/virome-dark-matter/software/taxonomizr/nodes.dmp') else print("Taxa Nodes already loaded")
+
+if(!exists("taxaNames")) 
+  taxaNames<-read.names('/media/lorax/projects/virome-dark-matter/software/taxonomizr/names.dmp') else print("Taxa Names already loaded")
+
+#Test that it works.
+taxaId<-accessionToTaxa(c("LN847353.1","AL079352.3"),"/media/lorax/projects/virome-dark-matter/software/taxonomizr/accessionTaxa.sql")
+print(taxaId)
+taxa_df <- as.data.frame(getTaxonomy(taxaId,taxaNodes,taxaNames))
+taxa_df$taxa_id <- rownames(taxa_df)
+
+#Clean up
+rm(taxa_df)
+rm(taxaId)
+
+```
+
+```{r Kraken annotation}
+#Cameroon files
+kraken_files <- list.files(path = "/media/THING2/louis/15_RubelCameroonShotgun/01_CameroonShotgun/sunbeam_output/classify/kraken_uniq/report",
+                           pattern = glob2rx("*.tsv"),
+                           full.names = TRUE)
+
+#Exclude the empty files. Feel like there should be a more elegant way to avoid these.
+kraken_files <- kraken_files[grep(pattern = "D0023-reports.tsv", kraken_files, 
+                                  invert = TRUE)]
+kraken_files <- kraken_files[grep(pattern = "D0041-reports.tsv", kraken_files, 
+                                  invert = TRUE)]
+
+kraken_dfs <- lapply(kraken_files, read_kraken_files)
+
+classify_df <- do.call(rbind, kraken_dfs)
+
+colnames(classify_df) <-c("PercentReads", 
+                          "CladeNumberReads",
+                          "TaxonNumberReads",
+                          "Kmers","Dup", "Coverage", 
+                          "TaxID", "Rank",
+                          "Name", "Sample")
+
+classify_df$Sample <- gsub("/media/THING2/louis/15_RubelCameroonShotgun/01_CameroonShotgun/sunbeam_output/classify/kraken_uniq/report/", 
+                           "", 
+                           classify_df$Sample)
+
+#Clean up
+rm(kraken_files)
+rm(kraken_dfs)
+
+```
+
+```{r Metadata}
+#Only want the shotgun samples
+meta_df <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/consign-kegg-r-ator/shotgun_metadata_cameroon_5119.csv", stringsAsFactors=FALSE) %$%
+  dplyr::mutate(., sampleID = gsub(pattern = "Shotgun_", replacement = "", sampleID)) %>%
+  dplyr::filter(sampleID %in% unique(classify_df$Sample)) %>%
+  droplevels.data.frame()
+
+  #dplyr::mutate(., sampleID = gsub(pattern = "Shotgun_", replacement = "", sampleID)) %>%
+  #dplyr::filter(sampleID %in% unique(classify_df$Sample)) %>%
+  #droplevels.data.frame()
+
+
+rownames(meta_df) = meta_df$sampleID
+meta_df = as.data.frame(meta_df[,-1])
+
+meta_df = as.data.frame(t(meta_df))
+
+IDdrops <- c("EB119","EB3","EB75","LibNeg1","LibNeg2")
+
+metadata_IDs_filtered <- meta_df[,!colnames(meta_df) %in% IDdrops]
+
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+
+newIDdrops <- which(is.na(metadata_IDs_filtered$BothCommensalPathogen))#check for NAs, note for downstream steps
+newIDdrops <- names(newIDdrops)
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+
+metadata_IDs_filtered <- metadata_IDs_filtered[,!colnames(metadata_IDs_filtered) %in% newIDdrops] 
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+
+
+```
+
+```{r Find the missing samples, eval=FALSE, include=FALSE}
+#Find the samples that have been analyzed by shotgun sequencing but are not in metadata
+setdiff(classify_df$Sample, metadata_IDs_filtered$sampleID)
+
+```
+
+##Giant relative abundance table for Meagan
+```{r All relative abundance table}
+g_taxa_df <- classify_df %>% 
+  dplyr::filter(., Rank == "species") %>%
+  droplevels.data.frame() %$%
+  getTaxonomy(unique(TaxID),taxaNodes,taxaNames) %>%
+  as.data.frame() %>%
+  dplyr::mutate(., TaxID = rownames(.)) %$%
+  dplyr::mutate(., TaxID = as.factor(trimws(TaxID, which = "both")))
+
+classify_genus_df <- merge(classify_df, g_taxa_df, "TaxID")
+
+sm_gen_df <- dplyr::select(classify_genus_df, Sample, CladeNumberReads, TaxonNumberReads, species, Name) 
+
+  
+abundance_df <-sm_gen_df %>% 
+  dplyr::mutate(TotalReads = (CladeNumberReads + 
+                                TaxonNumberReads)) %>% 
+  dplyr::select(c("TotalReads", "Name", "Sample")) %$%
+  dplyr::mutate(., Name = as.character(Name)) %$%
+  reshape2::acast(., Name ~ Sample, 
+                  value.var = "TotalReads", 
+                  fun.aggregate = sum) 
+
+
+#Check that things will add up to 1
+colSums(prop.table(abundance_df,2))
+
+all_abundance <- prop.table(abundance_df,2)
+#Check again
+colSums(all_abundance,2)
+
+
+all_abundance1 <- as.data.frame(all_abundance[,!colnames(all_abundance) %in% IDdrops])
+
+all_abundance <- as.data.frame(all_abundance1[,!colnames(all_abundance1) %in% newIDdrops])
+
+#all_abundance <- as.data.frame(all_abundance2[,!colnames(all_abundance2) %in% newIDdrops2])
+
+all_abundance_t <- as.data.frame(t(all_abundance))
+#all_abundance_t <- as.data.frame(t(all_abundance1))
+
+
+```
+
+```{r Data Preprocessing}
+#Remove rare features
+
+all_abundance_t_nonzero_counts <- apply(all_abundance_t, 1, function(y) sum(length(which(y > 0))))
+
+hist(all_abundance_t_nonzero_counts, breaks=100, col="grey", main="", ylab="Number of Taxa", xlab="Number of Non-Zero Values")
+
+#Based on the histogram, remove non-zero values in some percentage of the samples (e.g., .20 of samples) 
+#abundance_rare_removed <- remove_rare(table=all_abundance_t, cutoff_pro=0.50)
+all_abundance_t <- t(all_abundance_t)
+abundance_rare_removed <- remove_rare(table=all_abundance_t, cutoff_pro = 0.5)
+#head(abundance_rare_removed)
+#dim(abundance_rare_removed)
+#dim(all_abundance_t)
+#rownames(abundance_rare_removed)
+#renormalize table so that each sample's column sums to 100 
+abundance_norm <- sweep(abundance_rare_removed, 2, colSums(abundance_rare_removed) , '/')*100
+
+#head(abundance_norm)
+#dim(abundance_norm)
+#rownames(abundance_norm)
+
+#Transform data into normalized z-scores by subtracting each sample's mean (center) and then dividing by the sample's standard deviation (scale).
+abundance_scaled <- scale(abundance_norm, center = TRUE, scale = TRUE)
+#Prep input tables for classification of state
+abundance_scaled <- as.data.frame(t(abundance_scaled)) #double check that rows are sample id and taxa are columns
+#abundance_scaled <- t(abundance_scaled)
+
+abundance_scaled$BothCommensalPathogen <- metadata_IDs_filtered[rownames(abundance_scaled), 'BothCommensalPathogen']
+abundance_scaled$BothCommensalPathogen <- as.integer(abundance_scaled$BothCommensalPathogen)
+#abundance_scaled <- as.data.frame(abundance_scaled)
+#abundance_scaled$IL.5[6] <- "No"
+#abundance_scaled$IL.5[12] <- "No"
+#abundance_scaled$IL.5[54] <- "No"
+#Add positive control
+abundance_scaled_poscntrl <- abundance_scaled %>%
+  mutate(fake_taxon = add_noise(BothCommensalPathogen))
+
+#Drop unclassified
+abundance_scaled_poscntrl$unclassified <- NULL
+dim(abundance_scaled_poscntrl)
+str(abundance_scaled_poscntrl)
+abundance_scaled_poscntrl$BothCommensalPathogen <- as.factor(abundance_scaled_poscntrl$BothCommensalPathogen)
+str(abundance_scaled_poscntrl$BothCommensalPathogen)
+
+```
+Running RFC
+```{r}
+#Guidelines: use half caases, match with controls. 
+#table(abundance_scaled_poscntrl$BothCommensalPathogen)
+#1/2 pos = 13. Each group =13
+#Set the random seed so that models will be reproducible.
+set.seed(151)  
+
+#parallelize  job
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+colnames(abundance_scaled_poscntrl) <- make.names(colnames(abundance_scaled_poscntrl))
+
+#abundance_scaled_poscntrl$Lactose_Binary <- gsub(1, "LNP", abundance_scaled_poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl$Lactose_Binary <- gsub(2, "LP", abundance_scaled_poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl$Lactose_Binary <- as.factor(abundance_scaled_str(poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl <- as.matrix()
+
+RF_abundance_scaled_poscntrl_DS = randomForest(BothCommensalPathogen ~ ., abundance_scaled_poscntrl,ntree=5001,sampsize=c(13,13),strata=abundance_scaled_poscntrl$BothCommensalPathogen)
+
+#RF_asv_scaled_regression = randomForest(Lactose_Binary ~ ., abundance_scaled_poscntrl,ntree=5001,importance=TRUE, proximities=TRUE) #poscontrl included 
+#poscontrl, downsample
+
+print(RF_abundance_scaled_poscntrl_DS)
+
+par(mfrow=c(1,2))
+RF_state_classify_imp <- as.data.frame(RF_abundance_scaled_poscntrl_DS$importance )
+RF_state_classify_imp$features <- rownames( RF_state_classify_imp )
+RF_state_classify_imp_sorted <- arrange( RF_state_classify_imp  , desc(MeanDecreaseGini)  )
+RF_state_classify_imp_sorted <- RF_state_classify_imp_sorted[!grepl("fake_taxon", RF_state_classify_imp_sorted$features),] #Drop fake taxa fake_taxon
+
+
+barplot(RF_state_classify_imp_sorted$MeanDecreaseGini, ylab="Mean Decrease in Accuracy (Variable Importance)", main="RF Classification Variable Importance Distribution")
+
+barplot(RF_state_classify_imp_sorted[1:13,"MeanDecreaseGini"], names.arg=RF_state_classify_imp_sorted[1:13,"features"] , ylab="Mean Decrease in Accuracy (Variable Importance)", las=2, ylim=c(0,2), main="Classification RF with Positive Control")  
+
+Parasite_class <- data.frame(Feature = RF_state_classify_imp_sorted[1:13,"features"], Gini = RF_state_classify_imp_sorted[1:13,"MeanDecreaseGini"])
+
+p <- ggplot(Parasite_class, aes(x= reorder(Feature, Gini), y = Gini)) +
+ggtitle("Entamoeba Commensal & Pathogenic RF Classification") + 
+ylab("Mean Decrease in Gini (Variable Importance)") + 
+xlab("Feature") +
+geom_bar(stat="identity") + theme_bw()
+
+p + coord_flip()
+
+stopCluster(cl)
+```
+
+```{r}
+BA_Porphy <- ggplot(data = abundance_scaled_poscntrl, aes(x = BothCommensalPathogen, y = X..........Blastocystis.hominis)) + 
+  geom_boxplot()+
+  geom_point(position = position_jitter(width = 0.25), na.rm = TRUE) +
+  #facet_grid(. ~ Nematode) +
+  geom_point(aes(color = factor(BothCommensalPathogen))) +
+ scale_x_continuous(breaks = c(1, 15, 30, 45, 60, 75)) +
+  #ylim(0,4.5) +
+  geom_smooth(method = lm) +
+  geom_point(color='#453781FF')  +
+  labs(title = 'Normalized Abundances of RFC taxa and IL5',y= 'Porphyromonas asaccharolytica', x =   'IL.5') +
+  theme_bw()
+
+BA_Porphy <- ggplot(data = abundance_scaled_poscntrl, aes(x = IL.5, y = X....................Porphyromonas.asaccharolytica)) + 
+  #geom_boxplot()+
+  geom_point(position = position_jitter(width = 0.25), na.rm = TRUE) +
+  #facet_grid(. ~ Nematode) +
+  geom_point(aes(color = factor(IL.5))) +
+ scale_x_continuous(breaks = c(1, 15, 30, 45, 60, 75)) +
+  #ylim(0,4.5) +
+  geom_smooth(method = lm) +
+  geom_point(color='#453781FF')  +
+  labs(title = 'Normalized Abundances of RFC taxa and IL5',y= 'Porphyromonas asaccharolytica', x =   'IL.5') +
+  theme_bw()
+
+theme_aa_scatter <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+
+newtest <- abundance_scaled_poscntrl %>% select(
+`X..........Blastocystis.hominis`,
+`X....................Flavobacterium.magnum`,
+`X....................Erysipelotrichaceae.bacterium.SG0102`,
+`X..................Trueperella.pyogenes`,
+`X..................Staphylococcus.aureus`,
+`X................Shigella.dysenteriae`,
+`X................Rhodobacter.sphaeroides`,
+`X..........bacterium`,
+`X..................Anoxybacillus.kamchatkensis`,
+`X..................Enterobacter.cloacae`,
+BothCommensalPathogen)
+
+
+new <- melt(newtest, "BothCommensalPathogen")
+
+theme_scatter <- theme_bw(base_size = 24) + 
+  theme(
+  panel.grid.major.x = element_blank(),
+  panel.grid.major.y = element_blank(),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  line = element_line(size=1),
+  text = element_text(color = "black"),
+  axis.text.x = element_text(color="black"),
+  axis.text.y = element_text(color="black"),
+  strip.background=element_rect(fill="white", color="white")
+)
+
+mt <- ggplot(new, aes(variable, value, fill = factor(BothCommensalPathogen))) +
+  geom_boxplot() + 
+  theme_classic(base_size = 20) +
+  theme(axis.text.x=element_text(angle=45, hjust=1), strip.background=element_rect(fill="white", color="white"))  + theme_scatter + labs(fill = "Entamoeba Positive", x = "Shotgun Sequencing taxon", y = "Relative  Abundance (z-score)")
+
+
+
+
+a <- pairwise.wilcox.test(abundance_scaled_poscntrl$X..........Blastocystis.hominis, abundance_scaled_poscntrl$BothCommensalPathogen)
+b<- pairwise.wilcox.test(abundance_scaled_poscntrl$X....................Flavobacterium.magnum, abundance_scaled_poscntrl$BothCommensalPathogen)
+c<- pairwise.wilcox.test(abundance_scaled_poscntrl$X....................Erysipelotrichaceae.bacterium.SG0102, abundance_scaled_poscntrl$BothCommensalPathoge)
+d<- pairwise.wilcox.test(abundance_scaled_poscntrl$X..................Trueperella.pyogenes, abundance_scaled_poscntrl$BothCommensalPathogen)
+e<- pairwise.wilcox.test(abundance_scaled_poscntrl$X..................Staphylococcus.aureus, abundance_scaled_poscntrl$BothCommensalPathogen)
+f<- pairwise.wilcox.test(abundance_scaled_poscntrl$X................Shigella.dysenteriae, abundance_scaled_poscntrl$BothCommensalPathogen)
+g<- pairwise.wilcox.test(abundance_scaled_poscntrl$X................Rhodobacter.sphaeroides, abundance_scaled_poscntrl$BothCommensalPathogen)
+h<- pairwise.wilcox.test(abundance_scaled_poscntrl$X..........bacterium, abundance_scaled_poscntrl$BothCommensalPathogen)
+i<- pairwise.wilcox.test(abundance_scaled_poscntrl$X..................Anoxybacillus.kamchatkensis, abundance_scaled_poscntrl$BothCommensalPathogen)
+j<- pairwise.wilcox.test(abundance_scaled_poscntrl$X..................Enterobacter.cloacae, abundance_scaled_poscntrl$BothCommensalPathogen)
+
+third <- data.frame(taxon= c(a$data.name, b$data.name, c$data.name, d$data.name, e$data.name, f$data.name, g$data.name, h$data.name, i$data.name, j$data.name),
+                    pval=c(a$p.value,b$p.value,c$p.value,d$p.value,e$p.value,f$p.value,g$p.value,h$p.value,i$p.value,j$p.value))
+third$fdr <- NA
+
+third$fdr <-p.adjust(third$pval, method="fdr")
+
+
+
+lm(formula = abundance_scaled_poscntrl$BothCommensalPathogen ~ abundance_scaled_poscntrl$X..........Blastocystis.hominis)
+#porphyro goes up in IL5
+
+Prev <- grep('Prevotella.stercorea', RF_state_classify_imp_sorted$features, value = TRUE) %>% as.data.frame()
+colnames(Prev) <- "features"
+Prev_gini <- left_join(Prev, RF_state_classify_imp_sorted, by = 'features')
+Prev_gini <- mutate(Prev_gini, TotalGini = sum(`%IncMSE`)) %>% View()
+
+Rum <- grep('Ruminococcus.bromii', RF_state_classify_imp_sorted$features, value = TRUE) %>% as.data.frame()
+colnames(Rum) <- "features"
+Rum_gini <- left_join(Rum, RF_state_classify_imp_sorted, by = 'features')
+Rum_gini <- mutate(Rum_gini, TotalGini = sum(`%IncMSE`)) %>% View()
+
+Suc <- grep('Succinivibrio', RF_state_classify_imp_sorted$features, value = TRUE) %>% as.data.frame()
+colnames(Suc) <- "features"
+Suc_gini <- left_join(Suc, RF_state_classify_imp_sorted, by = 'features')
+Suc_gini <- mutate(Suc_gini, TotalGini = sum(`%IncMSE`)) %>% View()
+```
+
+
+Build RFC on just pathogenic Entamoeba
+```{r}
+abundance_scaled$PathogenOnly <- metadata_IDs_filtered[rownames(abundance_scaled), 'PathogenOnly']
+abundance_scaled$PathogenOnly <- as.integer(abundance_scaled$PathogenOnly)
+#abundance_scaled <- as.data.frame(abundance_scaled)
+#abundance_scaled$IL.5[6] <- "No"
+#abundance_scaled$IL.5[12] <- "No"
+#abundance_scaled$IL.5[54] <- "No"
+#Add positive control
+abundance_scaled_poscntrl <- abundance_scaled %>%
+  mutate(fake_taxon = add_noise(PathogenOnly))
+
+#Drop unclassified
+abundance_scaled_poscntrl$unclassified <- NULL
+abundance_scaled_poscntrl$BothCommensalPathogen <- NULL
+
+dim(abundance_scaled_poscntrl)
+str(abundance_scaled_poscntrl)
+abundance_scaled_poscntrl$PathogenOnly <- as.factor(abundance_scaled_poscntrl$PathogenOnly)
+str(abundance_scaled_poscntrl$PathogenOnly)
+
+
+```
+Running RFC
+```{r}
+#Guidelines: use half caases, match with controls. 
+#table(abundance_scaled_poscntrl$BothCommensalPathogen)
+#1/2 pos = 3. Each group =3
+#Set the random seed so that models will be reproducible.
+set.seed(151)  
+
+#parallelize  job
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+colnames(abundance_scaled_poscntrl) <- make.names(colnames(abundance_scaled_poscntrl))
+
+#abundance_scaled_poscntrl$Lactose_Binary <- gsub(1, "LNP", abundance_scaled_poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl$Lactose_Binary <- gsub(2, "LP", abundance_scaled_poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl$Lactose_Binary <- as.factor(abundance_scaled_str(poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl <- as.matrix()
+
+RF_abundance_scaled_poscntrl_DS = randomForest(PathogenOnly ~ ., abundance_scaled_poscntrl,ntree=5001,sampsize=c(3,3),strata=abundance_scaled_poscntrl$PathogenOnly)
+
+#RF_asv_scaled_regression = randomForest(Lactose_Binary ~ ., abundance_scaled_poscntrl,ntree=5001,importance=TRUE, proximities=TRUE) #poscontrl included 
+#poscontrl, downsample
+
+print(RF_abundance_scaled_poscntrl_DS)
+
+par(mfrow=c(1,2))
+RF_state_classify_imp <- as.data.frame(RF_abundance_scaled_poscntrl_DS$importance )
+RF_state_classify_imp$features <- rownames( RF_state_classify_imp )
+RF_state_classify_imp_sorted <- arrange( RF_state_classify_imp  , desc(MeanDecreaseGini)  )
+RF_state_classify_imp_sorted <- RF_state_classify_imp_sorted[!grepl("fake_taxon", RF_state_classify_imp_sorted$features),] #Drop fake taxa fake_taxon
+
+
+barplot(RF_state_classify_imp_sorted$MeanDecreaseGini, ylab="Mean Decrease in Accuracy (Variable Importance)", main="RF Classification Variable Importance Distribution")
+
+barplot(RF_state_classify_imp_sorted[1:10,"MeanDecreaseGini"], names.arg=RF_state_classify_imp_sorted[1:10,"features"] , ylab="Mean Decrease in Accuracy (Variable Importance)", las=2, ylim=c(0,2), main="Classification RF with Positive Control")  
+
+Parasite_class <- data.frame(Feature = RF_state_classify_imp_sorted[1:10,"features"], Gini = RF_state_classify_imp_sorted[1:10,"MeanDecreaseGini"])
+
+p <- ggplot(Parasite_class, aes(x= reorder(Feature, Gini), y = Gini)) +
+ggtitle("Entamoeba Pathogenic RF Classification") + 
+ylab("Mean Decrease in Gini (Variable Importance)") + 
+xlab("Feature") +
+geom_bar(stat="identity") + theme_bw()
+
+p + coord_flip()
+
+stopCluster(cl)
+```
+Build RFC on just commensal Entamoeba
+```{r}
+abundance_scaled$CommensalOnly <- metadata_IDs_filtered[rownames(abundance_scaled), 'CommensalOnly']
+abundance_scaled$CommensalOnly <- as.integer(abundance_scaled$CommensalOnly)
+#abundance_scaled <- as.data.frame(abundance_scaled)
+#abundance_scaled$IL.5[6] <- "No"
+#abundance_scaled$IL.5[12] <- "No"
+#abundance_scaled$IL.5[54] <- "No"
+#Add positive control
+abundance_scaled_poscntrl <- abundance_scaled %>%
+  mutate(fake_taxon = add_noise(CommensalOnly))
+
+#Drop unclassified
+abundance_scaled_poscntrl$unclassified <- NULL
+abundance_scaled_poscntrl$PathogenOnly <- NULL
+
+dim(abundance_scaled_poscntrl)
+str(abundance_scaled_poscntrl)
+abundance_scaled_poscntrl$CommensalOnly <- as.factor(abundance_scaled_poscntrl$CommensalOnly)
+str(abundance_scaled_poscntrl$CommensalOnly)
+table(abundance_scaled_poscntrl$CommensalOnly)
+
+```
+Running RFC
+```{r}
+#Guidelines: use half caases, match with controls. 
+#table(abundance_scaled_poscntrl$BothCommensalPathogen)
+#1/2 pos = 8. Each group =8
+#Set the random seed so that models will be reproducible.
+set.seed(151)  
+
+#parallelize  job
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+colnames(abundance_scaled_poscntrl) <- make.names(colnames(abundance_scaled_poscntrl))
+
+#abundance_scaled_poscntrl$Lactose_Binary <- gsub(1, "LNP", abundance_scaled_poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl$Lactose_Binary <- gsub(2, "LP", abundance_scaled_poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl$Lactose_Binary <- as.factor(abundance_scaled_str(poscntrl$Lactose_Binary)
+#abundance_scaled_poscntrl <- as.matrix()
+
+RF_abundance_scaled_poscntrl_DS = randomForest(CommensalOnly ~ ., abundance_scaled_poscntrl,ntree=5001,sampsize=c(8,8),strata=abundance_scaled_poscntrl$CommensalOnly)
+
+#RF_asv_scaled_regression = randomForest(Lactose_Binary ~ ., abundance_scaled_poscntrl,ntree=5001,importance=TRUE, proximities=TRUE) #poscontrl included 
+#poscontrl, downsample
+
+print(RF_abundance_scaled_poscntrl_DS)
+
+par(mfrow=c(1,2))
+RF_state_classify_imp <- as.data.frame(RF_abundance_scaled_poscntrl_DS$importance )
+RF_state_classify_imp$features <- rownames( RF_state_classify_imp )
+RF_state_classify_imp_sorted <- arrange( RF_state_classify_imp  , desc(MeanDecreaseGini)  )
+RF_state_classify_imp_sorted <- RF_state_classify_imp_sorted[!grepl("fake_taxon", RF_state_classify_imp_sorted$features),] #Drop fake taxa fake_taxon
+
+
+barplot(RF_state_classify_imp_sorted$MeanDecreaseGini, ylab="Mean Decrease in Accuracy (Variable Importance)", main="RF Classification Variable Importance Distribution")
+
+barplot(RF_state_classify_imp_sorted[1:10,"MeanDecreaseGini"], names.arg=RF_state_classify_imp_sorted[1:10,"features"] , ylab="Mean Decrease in Accuracy (Variable Importance)", las=2, ylim=c(0,2), main="Classification RF with Positive Control")  
+
+Parasite_class <- data.frame(Feature = RF_state_classify_imp_sorted[1:10,"features"], Gini = RF_state_classify_imp_sorted[1:10,"MeanDecreaseGini"])
+
+p <- ggplot(Parasite_class, aes(x= reorder(Feature, Gini), y = Gini)) +
+ggtitle("Entamoeba Commensal RF Classification") + 
+ylab("Mean Decrease in Gini (Variable Importance)") + 
+xlab("Feature") +
+geom_bar(stat="identity") + theme_bw()
+
+p + coord_flip()
+
+stopCluster(cl)
+```
+
+```{r}
+shotgun_metadata_cameroon <- read_delim("/media/THING2/louis/15_RubelCameroonShotgun/consign-kegg-r-ator/shotgun_metadata_cameroon_5119.csv", ",", escape_double = FALSE, trim_ws = TRUE)
+
+#shotgun_metadata_cameroon[is.na(shotgun_metadata_cameroon)] <- "Unknown" 
+CM_metadata <- shotgun_metadata_cameroon[!(shotgun_metadata_cameroon$ants_binary== "Unknown"),]
+
+                                              
+BA_Porphy <- ggplot(data = abundance_scaled_poscntrl, aes(x = IL.5, y = X....................Porphyromonas.asaccharolytica)) + 
+  #geom_boxplot()+
+  geom_point(position = position_jitter(width = 0.25), na.rm = TRUE) +
+  #facet_grid(. ~ Nematode) +
+  geom_point(aes(color = factor(IL.5))) +
+ scale_x_continuous(breaks = c(1, 15, 30, 45, 60, 75)) +
+  #ylim(0,4.5) +
+  geom_smooth(method = lm) +
+  geom_point(color='#453781FF')  +
+  labs(title = 'Normalized Abundances of RFC taxa and IL5',y= 'Porphyromonas asaccharolytica', x =   'IL.5') +
+  theme_bw()
+
+CM_metadata$IL.13 <- as.numeric(CM_metadata$IL.13)
+
+x <- ggplot(CM_metadata, aes(x = factor(ants_binary), y = IL.13)) +
+geom_boxplot(na.rm=TRUE) + 
+  theme_bw()

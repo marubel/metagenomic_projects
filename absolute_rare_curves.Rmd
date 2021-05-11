@@ -1,0 +1,40 @@
+Absolute diversity rarefaction curves (no sampling!)
+
+#calculate rarefaction using formula
+#sample: vector of numbers of individuals per species
+#step: size of sampling steps for rarefaction
+#maxN: maximum sample size tested
+quickRare<-function(sample,step=10,maxN=sum(sample)){
+  sampleSize<-20;
+  steps<-unique(c(seq(step,maxN,step),maxN))
+  output<-sapply(steps,function(x)rareEquation(sample,x))
+  return(data.frame('rare'=output,'sampleN'=steps))
+}
+
+#speciesCounts: vector of counts for each "species" e.g. c(10,100,5)
+#sampleSize: single value of number of draws from sample 
+rareEquation<-function(speciesCounts,sampleSize){
+  #numbers too big
+  #output2<-length(sample)-choose(sum(sample),sampleSize)^-1*sum(choose(sum(sample)-sample,sampleSize))
+  #message(output2)
+  #no way to log sum 
+  #logSum<-log(sum(choose(sum(sample)-sample,sampleSize)))
+  #output<-length(sample) - exp(- lchoose(sum(sample),sampleSize) + logSum)
+  #zeros can take computational time
+  speciesCounts<-speciesCounts[speciesCounts>0]
+  output<-sum(1-exp(lchoose(sum(speciesCounts)-speciesCounts,sampleSize)-lchoose(sum(speciesCounts),sampleSize)))
+  if(is.na(output)||is.infinite(output))browser()
+  return(output)
+}
+
+rare_table <- apply(cts, 2, function(x) quickRare (x, step=20, maxN=1000))
+
+steps=rare_table[[1]]$sampleN
+
+rare_table = do.call(cbind, lapply(rare_table, function(x) x$rare ))
+
+plot(1,1,type="n", xlim=range(steps), ylim=range(rare_table))
+for(i in 1:ncol(rare_table)){
+  lines(steps, rare_table[,i], col="#ff000099")
+  with(joined[joined$SampleID == colnames(rare_table)[i],] )
+}

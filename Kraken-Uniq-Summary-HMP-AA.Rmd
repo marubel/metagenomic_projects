@@ -1,0 +1,1036 @@
+---
+title: "Kraken-Uniq-Summary-HMP-AA"
+author: "Arwa Abbas, Meagan Rubel and Louis Taylor"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document: 
+    highlight: tango
+    theme: journal
+    toc: yes
+    toc_depth: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dev='svg'
+)
+```
+
+```{r Libraries, include=FALSE}
+library("tidyverse")
+library("magrittr")
+library("taxonomizr")
+library("reshape2")
+library("ggplot2")
+library("eclectic")
+library("pander")
+library("vegan")
+library("ape")
+```
+
+This is an R Markdown that summarizes k-mer based classification of shotgun metagenomic reads. Specifically, shotgun reads from fecal samples from 30 healthy individuals (15 male and 15 female) from [Human Microbiome Project](https://hmpdacc.org/hmp/) were analyzed by [Kraken Uniq](https://github.com/fbreitwieser/krakenuniq) using the database of bacterial, archaeal, viral, protozoan, fungal, and helminth sequences downloaded from NCBI nr/nt collection by Arwa in December 2018. This workflow was done using [sunbeam](https://github.com/sunbeam-labs/sunbeam) using the [Kraken Uniq extension](https://github.com/ArwaAbbas/sbx_kraken_uniq).
+
+The output is tab-delimited, with one line per taxon. The fields of the output,from left-to-right,are as follows:  
+
+Percentage of reads covered by the clade rooted at this taxon  
+Number of reads covered by the clade rooted at this taxon  
+Number of reads assigned directly to this taxon  
+Rank code reporting all 27 ranks defined in the NCBI taxonomy.
+NCBI taxonomy ID  
+Indented scientific name
+
+The output file of KrakenUniq report file is identical to Kraken. The report file has a couple of modifications - namely a header and three additional columns:  
+kmers: number of unique k-mers  
+dup: average number of times each unique k-mer has been seen  
+cov: coverage of the k-mers of the clade in the database
+
+```{r Read Kraken files}
+read_kraken_files <- function(filename) {
+                              x = read.delim(filename, comment.char="#",
+                                             stringsAsFactors = FALSE)
+                              samplename = gsub("-reports.tsv", "",filename)
+                              x$V10 = samplename
+                              return(x)
+                        }
+```
+
+```{r Plotting}
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Heatmap
+theme_aa_heatmap <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        strip.background.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+#Barchart
+theme_aa_bars <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+#Scatterplot
+theme_aa_scatter <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+
+
+```
+
+#Import data
+```{r Set up Taxonomizr, message=FALSE, include=FALSE, cache = TRUE}
+#Set up Taxonomizer databases from a shared site if it doesn't already exist.
+#This takes a while
+
+if(!exists("taxaNodes")) 
+   taxaNodes<-read.nodes('/media/lorax/projects/virome-dark-matter/software/taxonomizr/nodes.dmp') else print("Taxa Nodes already loaded")
+
+if(!exists("taxaNames")) 
+  taxaNames<-read.names('/media/lorax/projects/virome-dark-matter/software/taxonomizr/names.dmp') else print("Taxa Names already loaded")
+
+#Test that it works.
+taxaId<-accessionToTaxa(c("LN847353.1","AL079352.3"),"/media/lorax/projects/virome-dark-matter/software/taxonomizr/accessionTaxa.sql")
+print(taxaId)
+taxa_df <- as.data.frame(getTaxonomy(taxaId,taxaNodes,taxaNames))
+taxa_df$taxa_id <- rownames(taxa_df)
+
+#Clean up
+rm(taxa_df)
+rm(taxaId)
+
+```
+
+```{r Kraken annotation}
+#HMP
+kraken_files <- list.files(path = "/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/HMP/sunbeam_output/classify/kraken_uniq/report",
+                           pattern = glob2rx("*reports.tsv"),
+                           full.names = TRUE)
+
+
+kraken_dfs <- lapply(kraken_files, read_kraken_files)
+
+classify_df <- do.call(rbind, kraken_dfs)
+
+colnames(classify_df) <-c("PercentReads", 
+                          "CladeNumberReads",
+                          "TaxonNumberReads",
+                          "Kmers","Dup", "Coverage", 
+                          "TaxID", "Rank",
+                          "Name", "Sample")
+
+classify_df$Sample <- gsub("/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/HMP/sunbeam_output/classify/kraken_uniq/report/", 
+                           "", 
+                           classify_df$Sample)
+
+#Clean up
+rm(kraken_files)
+rm(kraken_dfs)
+
+```
+
+```{r HMP metadata}
+samps <- c("SRR1804648", "SRR1565914","SRR1803892", "SRR1803862", 
+"SRR1804618", "SRR1804286", "SRR1803903", "SRR1803864", "SRR1804203", "SRR1803877", 
+"SRR1804107", "SRR1804009", "SRR1804055", "SRR1804676", "SRR532163", "SRR1804148", 
+"SRR1804756", "SRR1031154", "SRR1804119", "SRR1803355", "SRR1803358", "SRR1804539", 
+"SRR1564387", "SRR512768", "SRR1803287", "SRR1031102", "SRR1804688", "SRR1804086", 
+"SRR514196", "SRR514305")
+
+
+meta_df <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/hmp_stool_final.csv", stringsAsFactors=FALSE) %>%
+  dplyr::filter(Run %in% samps)
+
+rm(samps)
+```
+
+```{r Find the missing samples}
+if(length(setdiff(classify_df$Sample, meta_df$Run)) == 0)
+  print("All samples have metadata")
+
+```
+
+#Summary visualizations
+
+Stacked bar-chart of % reads at highest taxonomic level or unclassified. No read count or spurious hit threshold.
+```{r Stacked bar chart of read classification, fig.height=5, fig.width=15}
+classify_df %>% 
+  dplyr::filter(., Rank == "superkingdom" | Name == "unclassified") %$%
+  merge(., meta_df[, c("Run", "Sex")], by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %$%
+  dplyr::mutate(., Assignment = as.factor(trimws(Name))) %$%
+  dplyr::mutate(., Assignment = fct_relevel(Assignment, 
+                                            "unclassified")) %>%
+  dplyr::mutate(Ethnicity = "HMP") %$%
+  ggplot(data = ., aes(x = Sample)) + 
+  geom_col(aes(y = PercentReads, fill = Assignment), 
+           width = 0.9) +
+  facet_grid(~ Ethnicity, scales = "free", 
+              space = "free") +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = c("#bababa",
+                               "#993404",
+                              "#1f78b4",
+                              "#fd8d3c",
+                              "#c994c7",
+                              "#6a3d9a"),
+                    labels = c("Unclassified",
+                               "Archaea",
+                               "Bacteria",
+                               "Eukaryota",
+                               "Viroids",
+                               "Viruses")) +
+  labs(x= NULL, 
+       y= "Percentage of Reads") + 
+  theme_aa_bars + 
+  theme(legend.text=element_text(size=rel(1.5)),
+        legend.title = element_text(size=rel(1.5)),
+        axis.text = element_text(size=rel(1.5)),
+        axis.title = element_text(size=rel(1.5)))
+```
+
+
+```{r Stacked bar chart of read classification by population, fig.height=5, fig.width=5}
+classify_df %>% 
+  dplyr::filter(., Rank == "superkingdom" | Name == "unclassified") %$%
+  merge(., meta_df[, c("Run", "Sex")], by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %$%
+  dplyr::mutate(., Assignment = as.factor(trimws(Name))) %$%
+  dplyr::mutate(., Assignment = fct_relevel(Assignment, 
+                                            "unclassified")) %>%
+  group_by(Assignment) %>%
+  summarise(MedianPercReads = median(PercentReads)) %>%
+  ungroup() %>%
+  dplyr::mutate(Ethnicity = "HMP") %>%
+  ggplot(data = ., aes(x = Ethnicity)) + 
+  geom_col(aes(y = MedianPercReads, fill = Assignment), 
+           width = 2) +
+  facet_grid(~ Ethnicity, scales = "free", 
+              space = "free") +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = c("#bababa",
+                               "#993404",
+                              "#1f78b4",
+                              "#fd8d3c",
+                              "#c994c7",
+                              "#6a3d9a"),
+                    labels = c("Unclassified",
+                               "Archaea",
+                               "Bacteria",
+                               "Eukaryota",
+                               "Viroids",
+                               "Viruses")) +
+  labs(x= NULL, 
+       y= "Percentage of Reads") + 
+  theme_aa_bars + 
+  theme(legend.text=element_text(size=rel(1.5)),
+        legend.title = element_text(size=rel(1.5)),
+        axis.text = element_text(size=rel(1.5)),
+        axis.title = element_text(size=rel(1.5)))
+
+
+```
+
+##Quality control
+Determining thresholds for calling an authentic hit based on relationship between unique number of k-mers and coverage of all the possible k-mers of that taxon at the species level. For the scatter plot, choosing four samples because otherwise it's a lot of data to plot.
+
+```{r Scatterplot of coverage and k-mers, eval=FALSE, fig.height=5, fig.width=5, include=FALSE}
+
+examp_samp <- c("SRR1804676", "SRR1804055", "SRR1804009", "SRR1804107")
+
+classify_df %>%
+  dplyr::filter(Sample %in% examp_samp) %>%
+  dplyr::filter(Rank == "species") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Kmers, y = Coverage)) + 
+  facet_grid(Rank ~ ., scales = "free", 
+              space = "free") + 
+  scale_x_log10() +
+  geom_point(alpha = 0.1) + 
+  theme_aa_scatter + 
+  labs(x= "Log10 K-mers", 
+       y="Clade K-mer Coverage")
+
+classify_df %>%
+  dplyr::filter(Sample %in% examp_samp) %>%
+  dplyr::filter(Rank == "species") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = CladeNumberReads, y = Coverage)) + 
+  facet_grid(Rank ~ ., scales = "free", 
+              space = "free") + 
+  scale_x_log10() +
+  geom_point(alpha = 0.1) + 
+  theme_aa_scatter + 
+  labs(x= "Log10 Reads", 
+       y="Clade K-mer Coverage")
+
+rm(examp_samp)
+
+```
+
+Calculating ratio of reads to unique k-mers. For an authentic hit want a low ratio, at least lower than 1. 
+```{r Histogram of ratio of reads to unique k-mers, eval=FALSE, fig.height=8, fig.width=4, include=FALSE}
+#Plot distribution
+dplyr::mutate(classify_df, Ratio = CladeNumberReads/Kmers) %>%
+  dplyr::filter(Rank == "species" | Rank == "genus") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Ratio)) + 
+  facet_grid(Rank ~ ., scales = "free", space = "free") +
+  geom_histogram(bins = 500, fill = "grey", color = "grey") +
+  labs(x= "Reads:Unique K-mers", 
+       y="Count") + 
+  theme_aa_scatter
+
+```
+
+```{r Species ratio} 
+dplyr::mutate(classify_df, Ratio = CladeNumberReads/Kmers) %>%
+  dplyr::filter(Rank == "species") %>%
+  droplevels.data.frame() %$%
+  pander(summary(.$Ratio), caption = "Distribution of Ratio for Classifying at Species Level")
+
+```
+
+```{r Genus ratio}
+#Genus
+dplyr::mutate(classify_df, Ratio = CladeNumberReads/Kmers) %>%
+  dplyr::filter(Rank == "genus") %>%
+  droplevels.data.frame() %$%
+  pander(summary(.$Ratio), caption = "Distribution of Ratio for Classifying at Genus Level")
+
+```
+
+```{r Ratio and reads parameters}
+ratio = 0.5
+reads = 10
+```
+
+##Taxonomy
+```{r Family level taxonomic information }
+#Get taxonomic information
+f_taxa_df <- classify_df %>% 
+  dplyr::filter(., Rank == "family") %>%
+  droplevels.data.frame() %$%
+  getTaxonomy(unique(TaxID),taxaNodes,taxaNames) %>%
+  as.data.frame() %>%
+  dplyr::mutate(., TaxID = rownames(.)) %$%
+  dplyr::mutate(., TaxID = as.factor(trimws(TaxID, which = "both")))
+
+```
+
+```{r Phylum level taxonomic information, cache = TRUE}
+p_taxa_df <- classify_df %>% 
+  dplyr::filter(., Rank == "phylum") %>%
+  droplevels.data.frame() %$%
+  getTaxonomy(unique(TaxID),taxaNodes,taxaNames) %>%
+  as.data.frame() %>%
+  dplyr::mutate(., TaxID = rownames(.)) %$%
+  dplyr::mutate(., TaxID = as.factor(trimws(TaxID, which = "both")))
+```
+
+##Viruses
+```{r Total viral reads classified}
+viral_reads <-classify_df %>% 
+  dplyr::filter(., Rank == "superkingdom") %$%
+  .[grep(c("*Viruses"),Name),] %>%
+  select(c("CladeNumberReads", "Sample"))
+
+colnames(viral_reads) <- c("TotalViralReads", "Sample")
+```
+
+```{r Species detections, cache = TRUE}
+#Obtain taxonomic information from TaxaID
+species_taxa_df <- classify_df %$%
+  dplyr::filter(., Rank == "species" | Rank == "sequence") %>%
+  droplevels.data.frame() %$%
+  getTaxonomy(unique(TaxID),taxaNodes,taxaNames) %>%
+  as.data.frame() %>%
+  dplyr::mutate(., TaxID = rownames(.)) %$%
+  dplyr::mutate(., TaxID = as.factor(trimws(TaxID, which = "both")))
+
+#Subset data frame for clean hits to viral species and sequences
+vir_species_df <- merge(classify_df, species_taxa_df, by = "TaxID", 
+                             all.x = FALSE) %$%
+  dplyr::mutate(., Ratio = CladeNumberReads/Kmers) %$%
+  dplyr::filter(., Rank == "species" | Rank == "sequence") %$%
+  dplyr::filter(., Ratio <= ratio & 
+                  CladeNumberReads >= reads &
+                  superkingdom == "Viruses")
+
+```
+
+Heatmap of species-level detections that have a reads:k-mer ratio less than `r as.character(ratio)` AND a minimum `r as.character(reads)` reads assigned to that species. Detections are grouped by viral family. Heatmap shows abundance normalized to total number of viral reads classified in each sample.
+
+```{r Eukaryotic viruses, fig.height=3, fig.width=6}
+
+# unique(vir_species_df$family) %>% as.character()
+
+vir_species_df %>% 
+  select(-c("TaxID", "PercentReads","TaxonNumberReads","Rank")) %$%
+  merge(., viral_reads, by = "Sample") %>% 
+  dplyr::mutate(prop = (CladeNumberReads/TotalViralReads)) %$%
+  dplyr::filter(., family %in% c("Poxviridae", 
+                                 "Retroviridae")) %$%
+    merge(., meta_df[, c("Run", "Sex")], 
+        by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Sample, y = Name)) + 
+  geom_tile(aes(fill = prop), 
+              color = "white",
+              size = 0.8, 
+              na.rm = FALSE) +
+  saturated_rainbow_cts(na.value = "grey50",
+                          guide = "colourbar",
+                          name = "Proportion of Viral Reads") +
+  labs(x= "Samples", y = NULL) +
+  theme_aa_heatmap
+
+```
+
+Too many samples to visualize prokaryotic viruses at the species level so all detections summed and grouped at family level.
+```{r Prokaryotic viruses, echo=FALSE, fig.height=4, fig.width=8}
+# unique(vir_species_df$family) %>% as.character()
+
+vir_species_df %>% 
+  select(c("Sample","CladeNumberReads", "Name","family")) %>%
+  group_by(Sample, family) %>%
+  summarise(TotalCladeReads = sum(CladeNumberReads)) %$%
+  merge(., viral_reads, by = "Sample", all.y = TRUE) %>% 
+  dplyr::mutate(prop = (TotalCladeReads/TotalViralReads)) %$%
+  dplyr::filter(., family %in% c("Myoviridae",
+                                 "Siphoviridae", 
+                                 "Microviridae")) %>%
+  merge(., meta_df[, c("Run", "Sex")], 
+        by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Sample, y = family)) + 
+  geom_tile(aes(fill = prop), 
+              color = "white",
+              size = 0.8, 
+              na.rm = FALSE) +
+  saturated_rainbow_cts(na.value = "grey50",
+                          guide = "colourbar",
+                          name = "Proportion of Viral Reads") +
+  labs(x= "Samples", y = NULL) +
+  theme_aa_heatmap 
+```
+
+##Prokaryotes and Eukaryotes
+
+```{r Total non-viral reads classified}
+bae_reads <- classify_df %>% 
+  dplyr::filter(., Rank == "superkingdom") %$% 
+  .[grep(c("*Viruses"),Name, invert = TRUE),] %>%
+  group_by(Sample) %>%
+  summarise(TotalBAEReads = sum(CladeNumberReads))
+
+```
+
+```{r Genera detected, cache = TRUE}
+#Obtain taxonomic information from TaxaID
+bae_taxa_df <- classify_df %>% 
+  dplyr::filter(., Rank == "genus") %$%
+  #Remove viruses
+  .[grep(c("*virus"),Name, invert = TRUE),] %>%
+  droplevels.data.frame() %$%
+  getTaxonomy(unique(TaxID),taxaNodes,taxaNames) %>%
+  as.data.frame() %>%
+  dplyr::mutate(., TaxID = rownames(.)) %$%
+  dplyr::mutate(., TaxID = as.factor(trimws(TaxID, which = "both")))
+  
+#Subset data frame for hits to genera.
+bae_g_df <- merge(classify_df, bae_taxa_df, by = "TaxID", 
+                             all.x = FALSE) %>%
+  dplyr::filter(., Rank == "genus")
+ 
+```
+
+Heat map of genus-level detections of prokaryotes that have a reads:k-mer ratio less than `r as.character(ratio)`. Heatmap only shows genera in greater than 1% abundance in each sample. Abundance normalized to total number of non-viral reads classified in each sample.
+```{r Prokaryotes, fig.height=10, fig.width=15}
+# unique(bae_g_df$genus) %>% as.character()
+
+bae_g_df %>% 
+  select(-c("TaxID", "PercentReads","TaxonNumberReads","Rank", "Name")) %$%
+  merge(., bae_reads, by = "Sample") %$% 
+  dplyr::mutate(., Ratio = CladeNumberReads/Kmers) %$%
+  dplyr::mutate(., prop = (CladeNumberReads/TotalBAEReads)) %$%
+  dplyr::filter(., prop >= 0.01 & Ratio <= ratio) %$%
+  dplyr::filter(., superkingdom == "Archaea" | superkingdom == "Bacteria") %$%
+  merge(., meta_df[, c("Run", "Sex")], 
+        by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Sample, y = genus)) + 
+  geom_tile(aes(fill = prop), 
+              color = "white",
+              size = 0.8, 
+              na.rm = FALSE) +
+  saturated_rainbow_cts(na.value = "grey50",
+                          guide = "colourbar",
+                          name = "Proportion of Reads") +
+  labs(x= "Samples", y = NULL) +
+  theme_aa_heatmap 
+```
+
+Investigate the outlier samples.
+```{r Outlier samples, include=FALSE}
+
+#Checking which ones are weird:
+
+bae_g_df %>%
+  select(-c("TaxID", "PercentReads","TaxonNumberReads","Rank", "Name")) %$%
+  merge(., bae_reads, by = "Sample") %$%
+  dplyr::mutate(., Ratio = CladeNumberReads/Kmers) %$%
+  dplyr::mutate(., prop = (CladeNumberReads/TotalBAEReads)) %$%
+  dplyr::filter(., prop >= 0.01 & Ratio <= ratio) %$%
+  dplyr::filter(., superkingdom == "Bacteria") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Sample)) +
+  geom_col(aes(y = prop, fill = phylum),
+           width = 0.9) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_brewer(type = "qual", palette = "Paired") +
+  labs(x= "Samples",
+       y="Percentage of Reads") +
+  theme(axis.text.x = element_text(angle = 90))
+
+weird_samp <- c("SRR1804286", "SRR514305", "SRR514196", "SRR1564387")
+
+# bae_g_df %$%
+#   merge(., bae_reads, by = "Sample") %$% 
+#   dplyr::filter(., Sample %in% weird_samp) %$%
+#   dplyr::mutate(., Ratio = CladeNumberReads/Kmers) %$%
+#   dplyr::mutate(., prop = (CladeNumberReads/TotalBAEReads)) %$%
+#    dplyr::filter(., Ratio <= ratio) %$%
+#   dplyr::filter(., superkingdom == "Bacteria") %>% View()
+  
+
+```
+Based on conversations with Meagan, going to drop these HMP samples (`r weird_samp`) from subsequent analyses.
+
+**Potential final figures for export**
+
+Where possible, colors for bacterial genera will match stacked bar-charts from Cameroon dataset. Notably, Prevotella is not within the top 15 most abundant genera in this subset of HMP.
+
+```{r Bacterial Phylum Only Relative Abundance Barchart, fig.height=5, fig.width=15}
+b_reads <- classify_df %>% 
+  dplyr::filter(., Rank == "superkingdom") %$%
+  .[grep(c("*Bacteria"),Name),] %>%
+  group_by(Sample) %>%
+  summarise(TotalBReads = (CladeNumberReads + TaxonNumberReads))
+
+#Start with a phylum-level dataframe of bacteria. No filtering for certain ratio or proportion. Exclude the weird samples.
+b_p_df <- classify_df[!classify_df$Sample %in% weird_samp,] %$%
+  merge(., p_taxa_df, by = "TaxID") %$%
+  dplyr::filter(., Rank == "phylum" & superkingdom == "Bacteria") %>%
+  dplyr::mutate(.,TotalBPReads = (CladeNumberReads + TaxonNumberReads)) %$%
+  merge(., b_reads, by = "Sample") %$% 
+  dplyr::mutate(., Ratio = TotalBPReads/Kmers) %$%
+  dplyr::mutate(., prop = (TotalBPReads/TotalBReads))
+
+
+#Pick top n most abundant family based on median abundance across all samples. Exclude negative controls.
+pick=15
+
+b_pick <- b_p_df %>%
+  drop_na(phylum) %>%
+  group_by(phylum) %>%
+  summarise(MedianProp = median(prop)) %>% 
+  dplyr::arrange(., desc(MedianProp)) %$%
+  .$phylum[1:pick] %>%
+  as.character() %>%
+  sort()
+
+#Colors here
+b_pick_col <- c(
+  "Acidobacteria" = "#9a0046",
+  "Actinobacteria" = "#6d60c5",
+  "Bacteroidetes" = "#56a43b",
+  "Chlorobi" = "#7b3ece",
+  "Chloroflexi" = "#958e38",
+  "Cyanobacteria" = "#cd4dc1",
+  "Deinococcus-Thermus" = "#4c6928",
+  "Firmicutes" = "#d24d77",
+  "Fusobacteria" = "#429b78",
+  "Planctomycetes" = "#d94c34",
+  "Proteobacteria" = "#d7d982",
+  "Spirochaetes" = "#6082c4",
+  "Synergistetes" = "#c47e3a",
+  "Tenericutes" = "#934c85",
+  "Verrucomicrobia" = "#934534"
+)
+
+#Plot bar chart
+b_p_df %>%
+  dplyr::mutate(., phylum = as.character(phylum)) %$%
+  dplyr::filter(., phylum %in% b_pick) %$% 
+  ggplot(data = ., aes(x = Sample)) + 
+  geom_col(aes(y = prop, fill = phylum)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = "15 Most Abundant Bacterial Phyla",
+                    values = b_pick_col) +
+  labs(x= "Samples", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))
+
+#Summarize abundances within whole group
+
+# b_p_pop_df <- dplyr::mutate(b_p_df, family = as.character(family)) %$%
+#   dplyr::filter(., phylum %in% b_pick) %>%
+#   group_by(phylum) %>%
+#   summarise(MedianProp = median(prop))
+# 
+# b_p_pop_df$Population <- "HMP"
+# 
+# ggplot(data = b_p_pop_df) +
+#   geom_col(aes(x = Population, y = MedianProp, fill = phylum),
+#            width = 1.5) +
+#   scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+#   facet_grid(~ Population, scales = "free", 
+#               space = "free") +
+#   # scale_fill_manual(name = "Most Abundant Bacterial Families", 
+#   #                   values = b_pick_col) +
+#   labs(x= NULL, 
+#        y="Relative Abundance") + 
+#   theme_aa_bars +
+#   theme(legend.text=element_text(size=rel(1.25)),
+#         axis.text = element_text(size=rel(1.25)),
+#         axis.title = element_text(size=rel(1.25)),
+#         panel.grid = element_blank(),
+#         panel.background = element_rect(fill = "grey"))
+
+
+#Clean up
+rm(pick)
+rm(b_pick)
+# rm(b_p_pop_df)
+```
+
+
+```{r Bacterial Genus Only Relative Abundance Barchart, fig.height=5, fig.width=15}
+
+#Start with the genus-level dataframe of bacteria, archaea and eukaryotes.
+b_g_df <- bae_g_df %>% 
+  dplyr::mutate(.,TotalBGReads = (CladeNumberReads + TaxonNumberReads)) %$%
+  merge(., b_reads, by = "Sample") %$% 
+  dplyr::mutate(., Ratio = TotalBGReads/Kmers) %$%
+  dplyr::mutate(., prop = (TotalBGReads/TotalBReads)) %$%
+  dplyr::filter(., prop >= 0.01 & Ratio <= ratio) %$%
+  dplyr::filter(., superkingdom == "Bacteria")
+
+
+#Pick top n most abundant genera based on median abundance across all samples. Exclude negative controls.
+pick=15
+
+b_pick <- b_g_df[!b_g_df$Sample %in% weird_samp,] %>%
+  group_by(genus) %>%
+  summarise(MedianProp = median(prop)) %>% 
+  dplyr::arrange(., desc(MedianProp)) %$%
+  .$genus[1:pick] %>%
+  as.character() %>%
+  sort()
+
+#Keeping colors consistent between Cameroon and HMP
+b_pick_col <- c(
+"Acidaminococcus" = "#9a0046",
+"Actinomyces" = "#02e8c1",
+"Akkermansia" = "#cb4623",
+"Alistipes" = "#b00079",
+"Bacteroides" = "#d60A13",
+"Collinsella" = "#e56cd9",
+"Faecalibacterium" = "#a6e57c",
+"Haemophilus" = "#4b4cbf",
+"Neisseria" = "#e9c83c",
+"Oscillibacter" = "#3b085f",
+"Parabacteroides" = "#ffae52",
+"Roseburia" = "#67a0ff",
+"Rothia" = "#01a876",
+"Ruminococcus" = "#ff9a00",
+"Streptococcus" = "#67a0ff",
+"Citrobacter" = "#ffae52",
+"Comamonas" = "#540040",
+"Escherichia" = "#d7d982",
+"Eubacterium" = "#7a376b",
+"Fusobacterium" = "#617600",
+"Klebsiella" = "#ff719a",
+"Megamonas" = "#5a000f",
+"Prevotella" = "#3E12F3",
+"Treponema" = "#7e0005",
+"Veillonella" = "#ff95a3",
+"Zymomonas" = "#a10e0b")
+
+
+#Plot bar chart
+b_g_df[!b_g_df$Sample %in% weird_samp,] %$%
+  dplyr::mutate(., genus = as.character(genus)) %$%
+  dplyr::filter(., genus %in% b_pick) %>% 
+  dplyr::mutate(Ethnicity = "HMP") %$%
+  ggplot(data = ., aes(x = Sample)) + 
+  geom_col(aes(y = prop, fill = genus)) +
+  facet_grid(~ Ethnicity, scales = "free", 
+              space = "free") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = "15 Most Abundant Bacterial Genera", 
+                    values = b_pick_col) +
+  labs(x= NULL,
+       y= NULL) + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))
+
+#Summarize abundances within entire population
+#Export size: 5" by 5.5" 
+b_g_pop_df <- b_g_df[!b_g_df$Sample %in% weird_samp,] %$%
+  dplyr::mutate(., genus = as.character(genus)) %$%
+  dplyr::filter(., genus %in% b_pick) %>%
+  group_by(genus) %>%
+  summarise(MedianProp = median(prop))
+
+b_g_pop_df$Population <- "HMP"
+
+ggplot(data = b_g_pop_df) +
+  geom_col(aes(x = Population, y = MedianProp, fill = genus),
+           width = 1.5) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  facet_grid(~ Population, scales = "free",
+              space = "free") +
+  scale_fill_manual(name = "15 Most Abundant Bacterial Genera",
+                    values = b_pick_col) +
+  labs(x= NULL,
+       y="Relative Abundance") +
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))
+
+#Clean up
+rm(pick)
+rm(b_pick)
+rm(b_g_pop_df)
+```
+
+```{r Bacteroides and Prevotella only boxplots, fig.height=3, fig.width=5}
+#Bacteroides and Prevotella only boxplots
+#Reads classified adjusting for genome length
+#Export 3" by 5"
+b_g_df[!b_g_df$Sample %in% weird_samp,]  %$%
+  dplyr::mutate(., genus = as.character(genus)) %$%
+  dplyr::filter(., genus %in% c("Bacteroides", "Prevotella")) %>% 
+  dplyr::select(c("Sample", "CladeNumberReads", "TaxonNumberReads", 
+                  "Rank", "TotalBGReads", "genus")) %>% 
+  dplyr::mutate(GenomeLengthKb = ifelse(genus == "Prevotella", 
+                                      2700, 5300)) %>% 
+  dplyr::mutate(ReadsPerKbGenome = (TotalBGReads/GenomeLengthKb)) %$% 
+  ggplot(data =., aes(x = 1, y = ReadsPerKbGenome, 
+                      color = genus)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_color_manual(values = b_pick_col, name = "Genus") +
+  labs(y= "Reads Classified per Kilobase Genome", x = NULL) +
+  theme_aa_boxplot +
+  theme(axis.text.x = element_blank())
+
+```
+
+
+```{r Bacterial Family Only Relative Abundance Barchart, fig.height=5, fig.width=15}
+#Start with a family-level dataframe of bacteria. No filtering for certain ratio or proportion.
+b_f_df <- merge(classify_df, f_taxa_df, by = "TaxID", 
+                             all.x = FALSE) %$%
+  dplyr::filter(., Rank == "family" & superkingdom == "Bacteria") %>%
+  dplyr::mutate(.,TotalBFReads = (CladeNumberReads + TaxonNumberReads)) %$%
+  merge(., b_reads, by = "Sample") %$% 
+  dplyr::mutate(., Ratio = TotalBFReads/Kmers) %$%
+  dplyr::mutate(., prop = (TotalBFReads/TotalBReads))
+
+#Pick top n most abundant family based on median abundance across all samples. Exclude negative controls.
+pick=15
+
+b_pick <- b_f_df[!b_f_df$Sample %in% weird_samp,] %>%
+  dplyr::group_by(family) %>%
+  dplyr::summarise(MedianProp = median(prop)) %$% 
+  dplyr::arrange(., desc(MedianProp)) %$%
+  .$family[1:pick] %>%
+  as.character() %>%
+  sort()
+
+#When possible using the same color scheme if bacterial genus is in the family.
+#Including families that are abundant in Cameroon
+b_pick_col <- c(
+  "Acidaminococcaceae" = "#9a0046",
+  "Bacteroidaceae" = "#d60A13",
+  "Clostridiaceae" = "#a6e57c",
+  "Enterobacteriaceae" = "#d7d982",
+  "Erysipelotrichaceae" = "#e56cd9",
+  "Eubacteriaceae" = "#7a376b",
+  "Flavobacteriaceae" = "#02e8c1",
+  "Lachnospiraceae" = "#d0185c",
+  "Odoribacteraceae" = "#cb4623",
+  "Oscillospiraceae" = "#3b085f",
+  "Peptostreptococcaceae" = "#4b4cbf",
+  "Porphyromonadaceae" = "#7deaa1",
+  "Prevotellaceae" = "#3E12F3",
+  "Rikenellaceae" = "#b00079",
+  "Ruminococcaceae" = "#e03a4e",
+  "Streptococcaceae" = "#67a0ff",
+  "Tannerellaceae" = "#a10e0b",
+  "Veillonellaceae" = "#ff95a3"
+)
+
+#Plot bar chart
+#Export size: 5" by 6"
+b_f_df[!b_f_df$Sample %in% weird_samp,] %$%
+  dplyr::mutate(., family = as.character(family)) %$%
+  dplyr::filter(., family %in% b_pick) %$%
+  ggplot(data = ., aes(x = Sample)) + 
+  geom_col(aes(y = prop, fill = family)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = "Most Abundant Bacterial Families", 
+                    values = b_pick_col) +
+  labs(x= "Samples", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))
+
+#Summarize abundances within population groups
+#Export size: 5" by 5.5"
+# b_f_pop_df <- b_f_df[!b_f_df$Sample %in% weird_samp,] %$%
+#   dplyr::mutate(., family = as.character(family)) %$%
+#   dplyr::filter(., family %in% b_pick) %>%
+#   group_by(family) %>%
+#   summarise(MedianProp = median(prop))
+# 
+# b_f_pop_df$Population <- "HMP"
+# 
+# ggplot(data = b_f_pop_df) +
+#   geom_col(aes(x = Population, y = MedianProp, fill = family),
+#            width = 1.5) +
+#   scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+#   facet_grid(~ Population, scales = "free", 
+#               space = "free") +
+#   scale_fill_manual(name = "Most Abundant Bacterial Families", 
+#                     values = b_pick_col) +
+#   labs(x= NULL, 
+#        y="Relative Abundance") + 
+#   theme_aa_bars +
+#   theme(legend.text=element_text(size=rel(1.25)),
+#         axis.text = element_text(size=rel(1.25)),
+#         axis.title = element_text(size=rel(1.25)),
+#         panel.grid = element_blank(),
+#         panel.background = element_rect(fill = "grey"))
+
+
+#Clean up
+rm(b_pick)
+rm(pick)
+rm(b_pick_col)
+
+```
+
+```{r All eukaryotes, eval=FALSE, fig.height=4, fig.width=6, include=FALSE}
+
+# Heatmap of genus-level detections of eukaryotes that have a reads:k-mer ratio less than `r as.character(ratio)` AND minimum of `r as.character(reads)` reads. Heatmap only shows genera in greater than 0.01% in the sample.  
+
+# unique(bae_g_df$genus) %>% as.character()
+
+bae_g_df %>% 
+  select(-c("TaxID", "PercentReads","TaxonNumberReads","Rank", "Name")) %$%
+  merge(., bae_reads, by = "Sample") %$% 
+  dplyr::mutate(., prop = (CladeNumberReads/TotalBAEReads)) %$%
+  dplyr::mutate(., Ratio = (CladeNumberReads/Kmers)) %$%
+  dplyr::filter(., superkingdom == "Eukaryota") %$%
+  dplyr::filter(., CladeNumberReads >= reads 
+                & Ratio <= ratio 
+                & prop >= 0.0001) %$%
+  merge(., meta_df[, c("Run", "Sex")], 
+        by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %>% 
+  ggplot(data = ., aes(x = Sample, y = genus)) + 
+  geom_tile(aes(fill = prop), 
+              color = "white",
+              size = 0.8, 
+              na.rm = FALSE) +
+  saturated_rainbow_cts(na.value = "grey50",
+                          guide = "colourbar",
+                          name = "Proportion of Reads") +
+  facet_grid(phylum ~ ., 
+             scales = "free", space = "free") +  
+  labs(x= "Samples", y = NULL) +
+  theme_aa_heatmap +
+  theme(strip.text.y = element_text(angle = 0, hjust = 0))
+```
+
+```{r Nematodes, eval=FALSE, fig.height=4, fig.width=6, include=FALSE}
+# Heatmap of all genus-level detections (uniqe k-mers) of nematodes that have a reads:k-mer ratio greater than `r as.character(ratio)` AND minimum of `r as.character(reads)`reads. Very unlikely that there will be any detections.
+
+bae_g_df %>% 
+  select(-c("TaxID", "PercentReads","TaxonNumberReads","Rank", "Name")) %$%
+  merge(., bae_reads, by = "Sample") %$% 
+  dplyr::mutate(., prop = (CladeNumberReads/TotalBAEReads)) %$%
+  dplyr::mutate(., Ratio = (CladeNumberReads/Kmers)) %$%
+  dplyr::filter(., phylum == "Nematoda" 
+                & Ratio <= ratio 
+                & CladeNumberReads >= reads) %$%
+  merge(., meta_df[, c("Run", "Sex")], 
+        by.x = "Sample", by.y = "Run") %>%
+  droplevels.data.frame() %$%
+  ggplot(data = ., aes(x = Sample, y = genus)) + 
+  geom_tile(aes(fill = prop), 
+              color = "white",
+              size = 0.8, 
+              na.rm = FALSE) +
+  saturated_rainbow_cts(na.value = "grey50",
+                          guide = "colourbar",
+                          name = "Proportion of Reads") +
+  labs(x= "Samples", y = NULL) +
+  theme_aa_heatmap +
+  theme(strip.text.y = element_text(angle = 0, hjust = 0))
+
+```
+
+### Relative abundances of relevant taxa in shotgun metagenomic sequencing. 
+
+Meagan's genera of interest:  
+1. Bacteroides  
+2. Prevotella  
+3. Treponema  
+4. Klebsiella 
+
+```{r Average relative abundance in each subsistence group shotgun}
+genera_shot <- c("Bacteroides", "Prevotella", "Treponema", "Klebsiella")
+
+#Non-rarefied data
+bae_g_df %>% 
+  select(c("Sample", "CladeNumberReads", "genus")) %$%
+  merge(., bae_reads, by = "Sample") %>% 
+  dplyr::mutate(prop = (CladeNumberReads/TotalBAEReads)) %>% 
+  dplyr::filter(genus %in% genera_shot) %$%
+  merge(., meta_df[, c("Run", "Sex")], 
+        by.x = "Sample", by.y = "Run") %>%
+  group_by(genus) %>%
+  summarise(RelativeProportion = mean(prop)) %>%
+  pander(caption = "Relative Abundance of 4 Genera in\n Westerners")
+
+```
+
+#Diversity and Similarity
+
+1.Inverse Simpson is the inverse of the classical Simpson diversity estimator. This parameter is preferred to other measures of alpha-diversity because it is an indication of the richness in a community with uniform evenness that would have the same level of diversity. This transformation means that λ **increases with increasing diversity**.  
+2. Shannon Diversity Index is another measure of alpha diversity that accounts for both abundance and evenness of the species present.  
+
+
+```{r Create count table}
+prok_g_counts <- bae_g_df %$%
+  #Bacteria and Archaea only
+  dplyr::filter(., superkingdom %in% c("Bacteria", "Archaea")) %$%
+  merge(., bae_reads, by = "Sample", all.y = FALSE) %>% 
+  dplyr::mutate(prop = (CladeNumberReads/TotalBAEReads)) %>% 
+  dplyr::filter(., prop >= 0.01) %>%
+  select(c("Sample", "CladeNumberReads", "genus")) %>% 
+  droplevels.data.frame() %>%
+  dplyr::mutate(genus = as.character(genus)) %$%
+  #Exclude NAs
+  drop_na(., genus) %$%
+  reshape2::acast(., Sample ~ genus, 
+                  value.var = "CladeNumberReads",
+                  fun.aggregate = sum)
+
+#Replace NA with 0
+prok_g_counts[is.na(prok_g_counts)] <- 0
+
+```
+
+```{r Rarefaction}
+rare_n <- 150000
+#Set seed for reproducibility
+set.seed(5790)
+g_abundance <- rowSums(prok_g_counts)
+
+prok_g_rare <- rrarefy(prok_g_counts, sample = rare_n)
+
+#Remove set seed
+rm(.Random.seed, envir=globalenv())
+rm(g_abundance)
+
+```
+
+What is the distribution of reads classified at prokaryotic genus level in each (human) sample? Specifically, the minimum number is `r as.character(min(rowSums(prok_g_counts)))` and the max is `r as.character(max(rowSums(prok_g_counts)))`. Currently calculating expected species richness in random subsamples of size `r as.character(rare_n)`. 
+
+```{r Alpha diversity, fig.height=3, fig.width=4}
+#Calculate Simpson's 1-D Index of Diversity for reach sample
+simpson <- diversity(prok_g_rare, index = "simpson")
+invsimpson <- diversity(prok_g_rare, index = "invsimpson")
+shannon <- diversity(prok_g_rare)
+
+#Create a table of HMP diversity values for import into other Rmarkdown
+as.data.frame(simpson) %$%
+  cbind(., as.data.frame(invsimpson)) %$%
+  cbind(., as.data.frame(shannon)) %$%
+  write.csv(., file = "2019-06-14-HMP-Alpha-Diversity.csv",
+            row.names = TRUE)
+
+#Plot Simpson
+# data.frame(names(simpson), simpson) %>%
+#   plyr::rename(replace = c("names.simpson." = "Sample")) %>%
+#   ggplot(data = ., aes(y = simpson)) + 
+#   geom_boxplot(outlier.shape = NA) + 
+#   labs(y= "Simpson Index", x = "HMP") +
+#   theme_aa_boxplot +
+#   theme(axis.text.x = element_blank())
+
+#Plot Inverse Simpson
+data.frame(names(invsimpson), invsimpson) %>%
+  dplyr::mutate(Group = "HMP") %>%
+  plyr::rename(replace = c("names.invsimpson." = "Sample")) %>%
+  ggplot(data = ., aes(y = invsimpson, x = Group)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitter(width = 0.25))+
+  labs(y= "Inverse Simpson Index", x ="HMP") +
+  theme_aa_boxplot +
+  theme(axis.text.x = element_blank())
+
+#Plot Shannon
+data.frame(names(shannon), shannon) %>%
+  dplyr::mutate(Group = "HMP") %>%
+  plyr::rename(replace = c("names.shannon." = "Sample")) %>%
+  ggplot(data = ., aes(y = shannon, x = Group)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitter(width = 0.25))+
+  labs(y= "Shannon Index", x = "HMP") +
+  theme_aa_boxplot +
+  theme(axis.text.x = element_blank())
+
+
+#Clean up
+rm(simpson)
+rm(shannon)
+rm(invsimpson)
+
+```
+

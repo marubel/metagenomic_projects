@@ -1,0 +1,388 @@
+---
+title: "CM_shotgun_BantuRegion_RFC.Rmd"
+author: "MAR"
+date: "6/19/2019"
+output: html_document
+---
+
+---
+title: "Cameroon_Shotgun_RFC"
+author: Meagan Rubel 
+date: March 7, 2019
+output: html_document
+---
+
+```{r Libraries, include=FALSE}
+library("tidyverse")
+library("magrittr")
+library("taxonomizr")
+library("reshape2")
+library("ggplot2")
+library("eclectic")
+library("pander")
+library("vegan")
+library("ape")
+library("scales")
+library("randomForest")
+library("plyr")
+library("caret")
+library("rfUtilities")
+library("ggplot2")
+library("ggbeeswarm")
+library("tidyr")
+library("readr")
+library("qiimer")
+library("doParallel")
+library("e1071")
+```
+
+This is an R Markdown that summarizes k-mer based classification of shotgun metagenomic reads. Specifically, shotgun reads from Cameroonian fecal samples were analyzed by [Kraken Uniq](https://github.com/fbreitwieser/krakenuniq) using the database of bacterial, archaeal, viral, protozoan, fungal, and helminth sequences downloaded from NCBI nr/nt collection by Arwa in December 2018. This workflow was done using [sunbeam](https://github.com/sunbeam-labs/sunbeam) using the [Kraken Uniq extension](https://github.com/ArwaAbbas/sbx_kraken_uniq).
+
+The output is tab-delimited, with one line per taxon. The fields of the output,from left-to-right,are as follows:  
+
+Percentage of reads covered by the clade rooted at this taxon  
+Number of reads covered by the clade rooted at this taxon  
+Number of reads assigned directly to this taxon  
+Rank code reporting all 27 ranks defined in the NCBI taxonomy.
+NCBI taxonomy ID  
+Indented scientific name
+
+The output file of KrakenUniq report file is identical to Kraken. The report file has a couple of modifications - namely a header and three additional columns:  
+kmers: number of unique k-mers  
+dup: average number of times each unique k-mer has been seen  
+cov: coverage of the k-mers of the clade in the database
+
+#Functions and themes 
+```{r Read Kraken files}
+read_kraken_files <- function(filename) {
+                              x = read.delim(filename, comment.char="#",
+                                             stringsAsFactors = FALSE)
+                              samplename = gsub("-reports.tsv", "",filename)
+                              x$V10 = samplename
+                              return(x)
+}
+```
+
+```{r Add noise/generate pos control in RFC data}
+#A standard deviation of 1 will give you a fairly correlated feature, s.d. of 0.3 will give you a highly correlated feature, and s.d. of 3 will give you an uncorrelated feature.
+
+add_noise <- function (x, sd=1) {
+  as.numeric(x) + rnorm(length(x), sd = sd)
+}
+```
+```{r Remove features that are non-zero less than a specified proportion of the time}
+
+remove_rare <- function( table , cutoff_pro ) {
+  row2keep <- c()
+  cutoff <- ceiling( cutoff_pro * ncol(table) )  
+  for ( i in 1:nrow(table) ) {
+    row_nonzero <- length( which( table[ i , ]  > 0 ) ) 
+    if ( row_nonzero > cutoff ) {
+      row2keep <- c( row2keep , i)
+    }
+  }
+  return( table [ row2keep , , drop=F ])
+}
+```
+
+```{r Plotting}
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Heatmap
+theme_aa_heatmap <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        strip.background.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+#Barchart
+theme_aa_bars <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+#Scatterplot
+theme_aa_scatter <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+
+#Kind of crazy, but these need to be in the exact same order as they would be as factors in the dataframe.
+ethnic_cols <-c("Bagyeli" = "#a9315c",
+                "Baka" = "#f58aa5",
+                "Bantu" = "#ffcc99", 
+                "Mbororo_Fulani" = "#999FFF")
+ANTS_shapes <- c("Neg" = 2,
+                 "Pos" = 17)
+
+```
+
+#Import data
+```{r Set up Taxonomizr, message=FALSE, include=FALSE, cache = TRUE}
+#Set up Taxonomizer databases from a shared site if it doesn't already exist.
+#This takes a while
+
+if(!exists("taxaNodes")) 
+   taxaNodes<-read.nodes('/media/lorax/projects/virome-dark-matter/software/taxonomizr/nodes.dmp') else print("Taxa Nodes already loaded")
+
+if(!exists("taxaNames")) 
+  taxaNames<-read.names('/media/lorax/projects/virome-dark-matter/software/taxonomizr/names.dmp') else print("Taxa Names already loaded")
+
+#Test that it works.
+taxaId<-accessionToTaxa(c("LN847353.1","AL079352.3"),"/media/lorax/projects/virome-dark-matter/software/taxonomizr/accessionTaxa.sql")
+print(taxaId)
+taxa_df <- as.data.frame(getTaxonomy(taxaId,taxaNodes,taxaNames))
+taxa_df$taxa_id <- rownames(taxa_df)
+
+#Clean up
+rm(taxa_df)
+rm(taxaId)
+
+```
+
+```{r Kraken annotation}
+#Cameroon files
+kraken_files <- list.files(path = "/media/THING2/louis/15_RubelCameroonShotgun/01_CameroonShotgun/sunbeam_output/classify/kraken_uniq/report",
+                           pattern = glob2rx("*.tsv"),
+                           full.names = TRUE)
+
+#Exclude the empty files. Feel like there should be a more elegant way to avoid these.
+kraken_files <- kraken_files[grep(pattern = "D0023-reports.tsv", kraken_files, 
+                                  invert = TRUE)]
+kraken_files <- kraken_files[grep(pattern = "D0041-reports.tsv", kraken_files, 
+                                  invert = TRUE)]
+
+kraken_dfs <- lapply(kraken_files, read_kraken_files)
+
+classify_df <- do.call(rbind, kraken_dfs)
+
+colnames(classify_df) <-c("PercentReads", 
+                          "CladeNumberReads",
+                          "TaxonNumberReads",
+                          "Kmers","Dup", "Coverage", 
+                          "TaxID", "Rank",
+                          "Name", "Sample")
+
+classify_df$Sample <- gsub("/media/THING2/louis/15_RubelCameroonShotgun/01_CameroonShotgun/sunbeam_output/classify/kraken_uniq/report/", 
+                           "", 
+                           classify_df$Sample)
+
+#Clean up
+rm(kraken_files)
+rm(kraken_dfs)
+
+```
+
+```{r Metadata}
+#Only want the shotgun samples
+meta_df <- read.csv("/media/lorax/users/marubel/V4_ANALYSIS/shotgun_metadata_cameroon_21319.csv", stringsAsFactors=FALSE) %$%
+  dplyr::mutate(., sampleID = gsub(pattern = "Shotgun_", replacement = "", sampleID)) %>%
+  dplyr::filter(sampleID %in% unique(classify_df$Sample)) %>%
+  droplevels.data.frame()
+
+meta_df$X <- NULL
+rownames(meta_df) = meta_df$sampleID
+meta_df = as.data.frame(meta_df[,-1])
+
+meta_df = as.data.frame(t(meta_df))
+
+IDdrops <- c("EB119","EB3","EB75","LibNeg1","LibNeg2")
+
+metadata_IDs_filtered <- meta_df[,!colnames(meta_df) %in% IDdrops]
+
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+which(is.na(metadata_IDs_filtered$Bantu_region))
+
+eastcities <- list("Bosquet", "Nkolbikong", "Missoume", "Aviation", "Njibot")
+southcities <- list('Bidou_I', 'Ndtoua')
+northwestcities <- list('Ntambang', 'Sabga')
+
+metadata_IDs_filtered$Region <- NULL
+metadata_IDs_filtered$Region <- mgsub(metadata_IDs_filtered$Sampling.Site, eastcities, "East")
+metadata_IDs_filtered$Region <- mgsub(metadata_IDs_filtered$Region, southcities, "South") 
+metadata_IDs_filtered$Region <- mgsub(metadata_IDs_filtered$Region, northwestcities, "Northwest")
+#Updated_CM_Metadata <- as.data.frame(t(Updated_CM_Metadata))
+metadata_IDs_filtered$Bantu_region <- NA
+metadata_IDs_filtered$Bantu_region <- with(metadata_IDs_filtered, ifelse(Population =="Bantu" & Region =="South", "Bantu_S", Bantu_region))
+metadata_IDs_filtered$Bantu_region <- with(metadata_IDs_filtered, ifelse(Population =="Bantu" & Region =="East", "Bantu_E", Bantu_region))
+metadata_IDs_filtered$Bantu_region <- with(metadata_IDs_filtered, ifelse(Population =="Bantu" & Region =="Northwest", "Bantu_NW", Bantu_region))
+
+metadata_IDs_filtered <- rownames_to_column(metadata_IDs_filtered, var = "sampleID")
+
+metadata_IDs_filtered2 <- metadata_IDs_filtered
+
+metadata_IDs_filtered2 <- metadata_IDs_filtered %>% filter(is.na(Bantu_region))
+
+newIDdrops <- c(metadata_IDs_filtered2$sampleID)
+
+#newIDdrops <- which(is.na(metadata_IDs_filtered$Bantu_region)) #check for NAs, note for downstream steps
+#newIDdrops <- names(newIDdrops)
+rownames(metadata_IDs_filtered) <- metadata_IDs_filtered$sampleID
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+
+metadata_IDs_filtered <- metadata_IDs_filtered[,!colnames(metadata_IDs_filtered) %in% newIDdrops] 
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+```
+
+```{r Find the missing samples, eval=FALSE, include=FALSE}
+#Find the samples that have been analyzed by shotgun sequencing but are not in metadata
+setdiff(classify_df$Sample, metadata_IDs_filtered$sampleID)
+
+```
+
+##Giant relative abundance table for Meagan
+```{r All relative abundance table}
+abundance_df <-classify_df %>% 
+  dplyr::mutate(TotalReads = (CladeNumberReads + 
+                                TaxonNumberReads)) %>% 
+  dplyr::select(c("TotalReads", "Name", "Sample")) %$%
+  dplyr::mutate(., Name = as.character(Name)) %$%
+  reshape2::acast(., Name ~ Sample, 
+                  value.var = "TotalReads", 
+                  fun.aggregate = sum) 
+
+#Check that things will add up to 1
+colSums(prop.table(abundance_df,2))
+
+all_abundance <- prop.table(abundance_df,2)
+#Check again
+colSums(all_abundance,2)
+
+
+all_abundance <- as.data.frame(all_abundance[,!colnames(all_abundance) %in% IDdrops])
+
+all_abundance <- as.data.frame(all_abundance[,!colnames(all_abundance) %in% newIDdrops])
+
+all_abundance_t <- as.data.frame(t(all_abundance))
+
+```
+
+```{r Data Preprocessing}
+#Remove rare features
+
+all_abundance_t_nonzero_counts <- apply(all_abundance_t, 1, function(y) sum(length(which(y > 0))))
+
+hist(all_abundance_t_nonzero_counts, breaks=100, col="grey", main="", ylab="Number of Taxa", xlab="Number of Non-Zero Values")
+
+#Based on the histogram, remove non-zero values in some percentage of the samples (e.g., .20 of samples) 
+#abundance_rare_removed <- remove_rare(table=all_abundance_t, cutoff_pro=0.50)
+
+abundance_rare_removed2 <- remove_rare(table=all_abundance, cutoff_pro = 0.50)
+#head(abundance_rare_removed)
+#dim(abundance_rare_removed)
+#rownames(abundance_rare_removed)
+
+#renormalize table so that each sample's column sums to 100 
+abundance_norm <- sweep(abundance_rare_removed2, 2, colSums(abundance_rare_removed2) , '/')*100
+#head(abundance_norm)
+#dim(abundance_norm)
+#rownames(abundance_norm)
+
+#Transform data into normalized z-scores by subtracting each sample's mean (center) and then dividing by the sample's standard deviation (scale).
+abundance_scaled <- scale(abundance_norm, center = TRUE, scale = TRUE)
+
+#Prep input tables for classification of state
+abundance_scaled <- as.data.frame(t(abundance_scaled)) #double check that rows are sample id and taxa are columns
+abundance_scaled$Bantu_region <- metadata_IDs_filtered[rownames(abundance_scaled), 'Bantu_region']
+
+#abundance_scaled$Total_ANTS <- as.factor(abundance_scaled$Total_ANTS)
+#abundance_scaled <- as.data.frame(abundance_scaled)
+str(abundance_scaled$Bantu_region)
+#Add positive control
+abundance_scaled_poscntrl <- abundance_scaled %>%
+  mutate(fake_taxon = add_noise(Bantu_region))
+
+#Drop unclassified
+abundance_scaled_poscntrl$unclassified <- NULL
+dim(abundance_scaled_poscntrl)
+```
+Running RFC
+```{r}
+#Guidelines: use half caases, match with controls. 
+#LNP: 34; LP: 9
+#1/2 pos = 5. Each group =5
+#Set the random seed so that models will be reproducible.
+set.seed(151)  
+
+#parallelize  job
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+colnames(abundance_scaled_poscntrl) <- make.names(colnames(abundance_scaled_poscntrl))
+
+abundance_scaled_poscntrl$Bantu_region <- as.factor(abundance_scaled_poscntrl$Bantu_region)
+#abundance_scaled_poscntrl <- as.matrix()
+
+RF_abundance_scaled_poscntrl_DS = randomForest(Bantu_region ~ ., abundance_scaled_poscntrl,ntree=5001,sampsize=c(5,5,5),strata=abundance_scaled_poscntrl$Bantu_region)
+
+#RF_asv_scaled_regression = randomForest(Lactose_Binary ~ ., abundance_scaled_poscntrl,ntree=5001,importance=TRUE, proximities=TRUE) #poscontrl included 
+#poscontrl, downsample
+
+print(RF_abundance_scaled_poscntrl_DS)
+
+par(mfrow=c(1,2))
+RF_state_classify_imp <- as.data.frame(RF_abundance_scaled_poscntrl_DS$importance )
+RF_state_classify_imp$features <- rownames( RF_state_classify_imp )
+RF_state_classify_imp_sorted <- arrange( RF_state_classify_imp  , desc(MeanDecreaseGini)  )
+RF_state_classify_imp_sorted <- RF_state_classify_imp_sorted[!grepl("fake_taxon", RF_state_classify_imp_sorted$features),] #Drop fake taxa fake_taxon
+
+
+barplot(RF_state_classify_imp_sorted$MeanDecreaseGini, ylab="Mean Decrease in Accuracy (Variable Importance)", main="RF Classification Variable Importance Distribution")
+
+barplot(RF_state_classify_imp_sorted[1:10,"MeanDecreaseGini"], names.arg=RF_state_classify_imp_sorted[1:10,"features"] , ylab="Mean Decrease in Accuracy (Variable Importance)", las=2, ylim=c(0,2), main="Classification RF with Positive Control")  
+
+Parasite_class <- data.frame(Feature = RF_state_classify_imp_sorted[1:10,"features"], Gini = RF_state_classify_imp_sorted[1:10,"MeanDecreaseGini"])
+
+p <- ggplot(Parasite_class, aes(x= reorder(Feature, Gini), y = Gini)) +
+ggtitle("Bantu_region RF Classification") + 
+ylab("Mean Decrease in Gini (Variable Importance)") + 
+xlab("Feature") +
+geom_bar(stat="identity") + theme_bw()
+
+
+p + coord_flip() +  theme(panel.grid.minor.x = element_blank(),
+                    panel.grid.minor.y = element_blank(),
+                    panel.grid.major.x = element_blank(),
+                    panel.grid.major.y = element_blank()) 
+stopCluster(cl)
+```
+
+```{r plotz_RF, dev="svg"}
+RF_state_classify_imp_sorted$features[1:10]
+
+newtest <- abundance_scaled_poscntrl %>% select(
+ `X....................CP002729.1.Escherichia.coli.UMNK88..complete.genome`,          
+ `X..................CP010122.1.Escherichia.coli.strain.C5..complete.genome`,         
+ `X..................Escherichia.coli.UMNK88`,                                        
+ `X........................FP929032.1.Alistipes.shahii.WAL.8301.draft.genome`,        
+ `X......................Alistipes.shahii.WAL.8301`,                                  
+ `X..................CP010236.1.Escherichia.coli.strain.S42..complete.genome`,        
+ `X..................CP010124.1.Escherichia.coli.strain.C5.plasmid.B..complete.genome`,
+ `X................Helicobacter`,                                                     
+ `X....................Odoribacter.splanchnicus`,                                     
+`X....................Alistipes.shahii`,    
+Total_ANTS)
+
+new <- melt(newtest, "Total_ANTS")
+
+mt <- ggplot(new, aes(Total_ANTS, value)) +
+ geom_point() +
+ theme_classic()+ #base_size = 40) +
+ facet_wrap(~variable)+
+ #scale_y_log10()+
+ theme(axis.text.x=element_text(angle=45, hjust=1)) #+
+ #scale_fill_manual(values=c("Negative" = "#ff9914", "Positive" = "#47a025")) #+ theme(axis.text.x = element_blank())
+
+#mt                  
+ggsave("Total_ANTS_shotgunRFC.svg", height= 25, width= 40, plot = last_plot(), dpi = 300)
+
+```

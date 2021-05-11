@@ -1,0 +1,30 @@
+
+### Presence/Absence Unifrac plots, colored by `r metadata_col`
+```{r}
+unw_pcoa <- pcoa_1way(mapping_subset, unw, var=metadata_col, strata="Cage")
+unw_pcoa$plot + geom_point(size=4)# + scale_color_manual(values=c("JK"="blue","AM"="green","BM"="red"))
+```
+
+#### Presence/Absence test for effect (group centroids), by `r metadata_col`
+```{r}
+udf <- droplevels(unw_pcoa$df)
+adonis(as.formula(paste("unw_pcoa$distances ~", paste(metadata_col,collapse="+"))), data=udf)
+```
+
+### Abundance weighted Unifrac plots, colored by `r metadata_col`
+
+```{r}
+wtu_pcoa <- pcoa_1way(mapping_subset, wtu, var=metadata_col, strata="Cageid")
+wtu_pcoa$plot + geom_point(size=4)#+ 
+```
+
+### Weighted test for effect (group centroids), by `r metadata_col`
+```{r}
+wdf <- droplevels(wtu_pcoa$df)
+adonis(as.formula(paste("wtu_pcoa$distances ~", paste(metadata_col,collapse="+"))), data=wdf)
+```
+
+### Differing taxa by Kruskall-Wallis between `r metadata_col`
+```{r echo=FALSE}
+test_taxon_abundance(mapping_subset, cts, paste(metadata_col[1]), a=a )
+```

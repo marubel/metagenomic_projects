@@ -1,0 +1,332 @@
+---
+title: "Sequencing-Depth"
+author: "Arwa Abbas, Meagan Rubel, and Louis Taylor"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dev = "svg"
+)
+```
+
+```{r Libraries, include=FALSE}
+library("tidyverse")
+library("magrittr")
+library("reshape2")
+library("ggplot2")
+library("pander")
+library("rentrez")
+```
+
+This is an R Markdown that summarizes sequencing (either as total base pairs or reads) in shotgun metagenomic studies of hunter-gatherer and/or industrialized human populations including:  
+8 fecal and 14 oral samples from Yanomami Amerindians and age and sex matched Puerto Ricans from [Clemente 2015](https://doi.org/10.1126/sciadv.1500183).  
+Fecal samples from Italians and Tanzanians from [Rampelli 2015](https://doi.org/10.1016/j.cub.2015.04.055).  
+Fecal samples from healthy Mongolian adults from [Liu 2016](https://doi.org/10.1038/srep34826).  
+Fecal samples from Liberia and Indonesia from [Rosa 2018](https://doi.org/10.1186/s40168-018-0416-5).  
+Fecal samples from African hunter-gatherers by Rubel et al.  
+Fecal samples from 30 healthy individuals (15 male and 15 female) from [Human Microbiome Project](https://hmpdacc.org/hmp/).
+
+#Functions and themes 
+```{r Plotting}
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+```
+
+#Import data
+```{r Study information}
+
+PM_ids  <- c("26229982", "25981789", "27708392", "29486796", "22699609")
+
+#Manually fixing some troublesome IDs.
+
+PMID_df <- data_frame(ID = character(), 
+                    Title = character(), 
+                    Journal=character(), 
+                    Date=character())
+
+for (i in 1:length(PM_ids)) { 
+  id = PM_ids[i]
+  paper_sum <- entrez_summary(db="pubmed", id = id)
+  
+  paper_title <- extract_from_esummary(paper_sum, "title")
+  paper_source <- extract_from_esummary(paper_sum, "source")
+  paper_date <- extract_from_esummary(paper_sum, "pubdate")
+  
+  paper_df <- data.frame(id,paper_title,paper_source,paper_date)
+  
+  PMID_df <- rbind(PMID_df, setNames(paper_df, names(PMID_df)))
+
+}
+
+pander(PMID_df, caption = "Datasets Analyzed", 
+       split.table = Inf, justify = 'left')
+
+#Clean up
+rm(paper_sum)
+rm(paper_title)
+rm(paper_source)
+rm(paper_date)
+rm(PM_ids)
+rm(paper_df)
+rm(i)
+rm(id)
+  
+```
+
+```{r Preprocess data}
+#Clementi
+cle_preprocess_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/Clemente2015/sunbeam_output/qc/reports/preprocess_summary.tsv", stringsAsFactors=FALSE)
+
+#Rampelli
+ram_preprocess_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/Rampelli2015/sunbeam_output/sunbeam_output/qc/reports/preprocess_summary.tsv", stringsAsFactors=FALSE)
+
+#Liu
+liu_preprocess_df <-read.delim("/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/Liu2016/sunbeam_output/qc/reports/preprocess_summary.tsv", stringsAsFactors=FALSE)
+
+#Rosa-Transferring now
+rosa_preprocess_df <-read.delim("/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/Rosa2018Worms/sunbeam_output/qc/reports/preprocess_summary.tsv", stringsAsFactors=FALSE)
+
+#HMP-no reads aligned to human genome which makes sense since they were supposed to be removed before upload
+
+
+```
+
+
+SRA metadata tables that were either directly downloaded by hisss by Louis Taylor or taken from SRA portal.
+
+```{r Clementi SRA metadata}
+
+# Amerindians were subjects 3, 5, 6, and 23. Assume the remaining IDs are are the matched Puerto Ricans.
+y_samples <- c("F3", "F5", "F6", "F23", "O3", "O5", "O6", "O23")
+
+cle_meta_df <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/SRP049631.tsv", stringsAsFactors=FALSE) %$%
+  dplyr::mutate(., SampleTypeAL = ifelse(grepl("F", SampleName), "Fecal", "Oral")) %$%
+  dplyr::mutate(., GroupAL = ifelse(SampleName %in% y_samples, 
+                                    "Yanomami", "PuertoRicans"))
+
+#Clean up
+rm(y_samples)
+
+```
+
+```{r Rampelli SRA metadata}
+ram_meta_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/SRP056480.txt", stringsAsFactors=FALSE)
+```
+
+For Liu et al:  
+The region of collection is related to subsistence practices and lifestyle.  
+1. Mongolia: Ulan Bator is a city.  
+2. China: Inner Mongolia is a mixture of samples from Hohhot city and the Xilingol pasturing areas.  
+3. Mongolia: Khentti is a pasturing area.  
+4. Mongolia: TUW province is suburbs of the city. 
+```{r Liu SRA metadata}
+liu_meta_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/Liu_more_SRA_metadata.txt", stringsAsFactors=FALSE)
+
+liu_nut_meta_df <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/Liu_TableS1.csv", stringsAsFactors=FALSE)
+
+```
+
+```{r Rubel metadata}
+#Only want the shotgun samples
+rub_meta_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/Shotgun_FULL_CM_metadata_2019-01-30.txt", stringsAsFactors=FALSE) %$%
+  dplyr::mutate(., sampleID = gsub(pattern = "Shotgun_", replacement = "", sampleID))
+
+rub_seq_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/03_Analyses/SeqSummaries/2018-11-30_cameroon_preprocess_summary.tsv", stringsAsFactors=FALSE)
+
+```
+
+```{r Rosa metadata}
+#Based on the methods section and their addditional tables 1 and 2, know that the "P6" in the sample name refers to samples from Liberia. The others are assumed to be Indonesians who have samples from 2 different time points (2008 and 2010). It's in order so that for a given subject #, the first sample is from 2008 and the second is from 2010. Not adding that to the dataframe right now though.
+
+rosa_meta_df <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/02_OtherDatasets/Rosa2018Worms/SRP118697.tsv", stringsAsFactors=FALSE) %>%
+  dplyr::mutate(GroupAL = ifelse(grepl("P6", SampleName), "Liberian", "Indonesian"))
+
+```
+
+```{r HMP metadata}
+samps <- c("SRR1804648", "SRR1565914","SRR1803892", "SRR1803862", 
+"SRR1804618", "SRR1804286", "SRR1803903", "SRR1803864", "SRR1804203", "SRR1803877", 
+"SRR1804107", "SRR1804009", "SRR1804055", "SRR1804676", "SRR532163", "SRR1804148", 
+"SRR1804756", "SRR1031154", "SRR1804119", "SRR1803355", "SRR1803358", "SRR1804539", 
+"SRR1564387", "SRR512768", "SRR1803287", "SRR1031102", "SRR1804688", "SRR1804086", 
+"SRR514196", "SRR514305")
+
+
+hmp_meta_df <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/hmp_stool_final.csv", stringsAsFactors=FALSE) %>%
+  dplyr::filter(Run %in% samps)
+
+rm(samps)
+```
+
+#Summary visualizations
+```{r Sequencing depth, fig.height=6, fig.width=10}
+
+#Rampelli
+ggplot(data = ram_meta_df, 
+       aes(x = geo_loc_name, y=MBases, color = geo_loc_name)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Sequencing depth (Mega bp)", 
+       x = NULL) +
+  ggtitle("Rampelli") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Clementi
+ggplot(data = cle_meta_df, 
+       aes(x = GroupAL, y=(bases/1000000), color = GroupAL)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Sequencing depth (Mega bp)", 
+       x = NULL) +
+  ggtitle("Clementi") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Liu
+ggplot(data = liu_meta_df, 
+       aes(x = geo_loc_name, y=MBases, color = geo_loc_name)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Sequencing depth (Mega bp)", 
+       x = NULL) +
+  ggtitle("Liu") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Rosa
+ggplot(data = rosa_meta_df, 
+       aes(x = GroupAL, y=(bases/1000000), color = GroupAL)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Sequencing depth (Mega bp)", 
+       x = NULL) +
+  ggtitle("Rosa") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Rubel
+merge(rub_seq_df, rub_meta_df[, c("sampleID", "Ethnicity")], 
+      by.x = "Samples", by.y = "sampleID") %$%
+  ggplot(data = ., 
+       aes(x = Ethnicity, y=nonhost, color = Ethnicity)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Sequencing depth (Read Pairs)", 
+       x = NULL) +
+  ggtitle("Rubel") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#HMP
+ggplot(data = hmp_meta_df, 
+       aes(x = BioProject, y=spots_with_mates, color = BioProject)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_x_discrete(labels = c("HMP")) +
+  scale_y_continuous() + 
+  labs(y = "Sequencing depth (Read Pairs)", 
+       x = NULL) +
+  ggtitle("HMP") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+```
+
+In theory, data uploaded to the SRA should already be cleaned of human sequences so differences between studies will likely not be informative. These are human sequences that were identified by mapping to the human genome during Sunbeam. 
+```{r Overall human reads}
+#Rampelli
+ram_preprocess_df %>%
+  dplyr::mutate(FractionHuman = (host/nonhost)) %$%
+  merge(., ram_meta_df, by.x = "Samples", by.y = "Run") %$% 
+  ggplot(data = ., aes(x = geo_loc_name, y = FractionHuman, color = geo_loc_name)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Fraction Human Sequences", 
+       x = NULL) +
+  ggtitle("Rampelli") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Clementi
+cle_preprocess_df %>%
+  dplyr::mutate(FractionHuman = (host/nonhost)) %$%
+  merge(., cle_meta_df, by.x = "Samples", by.y = "Run") %$% 
+  ggplot(data = .,
+       aes(x = GroupAL, y=FractionHuman, color = GroupAL)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Fraction Human Sequences", 
+       x = NULL) +
+  ggtitle("Clementi") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Liu
+liu_preprocess_df %>%
+  dplyr::mutate(FractionHuman = (host/nonhost)) %$%
+  merge(., liu_meta_df, by.x = "Samples", by.y = "Run") %$% 
+  ggplot(data = .,
+       aes(x = geo_loc_name, y=FractionHuman, color = geo_loc_name)) +
+  geom_boxplot() +
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() +
+  labs(y = "Fraction Human Sequences",
+       x = NULL) +
+  ggtitle("Liu") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Rosa
+rosa_preprocess_df %>%
+  dplyr::mutate(FractionHuman = (host/nonhost)) %$%
+  merge(., rosa_meta_df, by.x = "Samples", by.y = "Run") %$% 
+  ggplot(data = .,
+       aes(x = GroupAL, y=FractionHuman, color = GroupAL)) +
+  geom_boxplot() +
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() +
+  labs(y = "Fraction Human Sequences",
+       x = NULL) +
+  ggtitle("Rosa") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+#Rubel
+rub_seq_df %>%
+  dplyr::mutate(FractionHuman = (host/nonhost)) %$% 
+  merge(., rub_meta_df[, c("sampleID", "Ethnicity")], 
+      by.x = "Samples", by.y = "sampleID") %$%
+  ggplot(data = ., 
+       aes(x = Ethnicity, y=FractionHuman, color = Ethnicity)) + 
+  geom_boxplot() + 
+  geom_point(position = position_jitter(width = 0.25)) +
+  scale_y_continuous() + 
+  labs(y = "Fraction Human Sequences", 
+       x = NULL) +
+  ggtitle("Rubel") +
+  theme_aa_boxplot +
+  guides(color = "none")
+
+
+```
+
+

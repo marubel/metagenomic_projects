@@ -1,0 +1,93 @@
+```{r echo=FALSE}
+library(qiimer)
+library(ape)
+library(vegan)
+library(ggplot2)
+library(plyr)
+library(reshape2)
+library(kylemisc)
+```
+
+```{r pcoa_1way, echo=FALSE}
+#' Perform a PCoA analysis of one variable
+#' @param s The sample table
+#' @param d A distance matrix.  The matrix will be trimmed to include only the samples in `s`.
+#' @param var The variable of interest (string)
+#' @param strata If data is stratified, the name of the column containing the strata
+pcoa_1way <- function(s, d, var="study_group", strata=NULL) {
+  # Select columns of interest from distance matrix
+  distances <- dist_subset(d, s$SampleID)
+
+  res <- list()
+  
+  # Run the actual PCoA ordination
+  res$pcoa <- pcoa(distances)
+  
+  # Save distances and sample info back into result
+  res$distances <- distances
+  res$df <- cbind(s, res$pcoa$vectors[,1:3])
+  
+  # Make a simple plot, save in result
+  res$plot <- ggplot(res$df, aes_string(x="Axis.1", y="Axis.2", color=var)) + 
+    geom_point() + 
+    scale_colour_gradientn(colours=c("red", "blue")) +
+    labs(title = " + scale_colour_gradientn(colours=c(''red'', ''blue'')) \n" ) +
+    theme_classic() 
+  
+  # Run an adonis test, save in result
+  adonis_formula <- formula(paste("distances ~", var))
+  strata_arg <- if (is.null(strata)) NULL else res$df[[strata]]
+  res$test <- adonis(adonis_formula, data=s, strata=strata_arg)
+  
+  # Fix the test results:
+  # Print the actual formula instead of "adonis_formula"
+  # Replace the strata, too, for readability
+  adonis_call <- as.list(res$test$call)
+  adonis_call$formula <- adonis_formula
+  # Have to do some R metaprogramming to make this look right...
+  adonis_call$strata <- if (is.null(strata)) NULL else substitute(s$strata, list(strata=strata))
+  res$test$call <- as.call(adonis_call)
+
+  class(res) <- "pcoa_1way"
+  res
+}
+
+print.pcoa_1way <- function (x) {
+  print(x$plot)
+#  print(x$test)
+}
+```
+
+# Beta Diversity
+
+```{r echo=FALSE}
+# Read in sample mapping file
+s <- read_qiime_mapping_file("BLR000712_qiime_keepers.txt")
+```
+
+```{r echo=FALSE}
+wtu <- read_qiime_distmat("beta_diversity/weighted_normalized_unifrac_dm.txt")
+unw <- read_qiime_distmat("beta_diversity/unweighted_unifrac_dm.txt")
+```
+
+```{r, fig.height=4, fig.width=5.5}
+weighted <- pcoa_1way(s, wtu, var="study_day")
+print(weighted)
+```
+#### Weighted test for effect (group centroids)
+```{r}
+wdf <- droplevels(weighted$df)
+adonis(weighted$distances ~ study_day, data=wdf)
+```
+
+#### Unweighted Unifrac
+```{r, fig.height=4, fig.width=5.5}
+unweighted <- pcoa_1way(s, unw, var="study_day")
+print(unweighted)
+```
+
+#### Weighted test for effect (group centroids)
+```{r}
+udf <- droplevels(unweighted$df)
+adonis(unweighted$distances ~ study_day, data=udf)
+```

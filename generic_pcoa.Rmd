@@ -1,0 +1,72 @@
+
+```{r DeNOVO OTU code, echo=FALSE}
+# Assign sample mapping file
+s <- read_qiime_mapping_file("P55_mapping_Rbx_UPenn.txt")
+
+# Replicate sample
+s_original <- subset(s, Sample.Pooling %in% "Original")
+
+# Assign OTU table
+o <- read_qiime_otu_table("otu/classic_otu_table.txt")
+
+# Metadata in the form of truncated green genes assignments
+md <- sub("(; [kpcofgs]__)+$", "", o$metadata, perl=T)
+
+# Assignments data-frame
+adf <- split_assignments(md)
+a <- simplify_assignments(adf)
+
+# Arrange s by StudyGroup, then by SubjectID, then by Age_bin
+s <- arrange(s, StudyGroup, SubjectID, Age_bin)
+
+# Check for invalid sample IDs
+problem_ids <- setdiff(s$SampleID, colnames(o$counts))
+if (length(problem_ids ) > 0) stop (simpleError(paste("id mismatch found", problem_ids, collapse=" ")))
+
+# Assignment counts per SampleID
+cts <- o$counts[,s$SampleID]
+```
+
+
+## --------------------------------------------------------
+
+```{r echo=FALSE, message=FALSE}
+unw <- read_qiime_distmat("beta_diversity/unweighted_unifrac_dm.txt")
+wtu <- read_qiime_distmat("beta_diversity/weighted_normalized_unifrac_dm.txt")
+```
+## Beta diversity analyses
+
+```{r}
+mapping_subset <- s_rectal_S004
+metadata_col <- "BodySite"
+mapping_subset$Period <- factor(mapping_subset$Period)
+```
+
+### Presence/Absence Unifrac plots, colored by `r metadata_col`
+```{r}
+unw_pcoa <- pcoa_1way(mapping_subset, unw, var=metadata_col)
+unw_pcoa$plot # + scale_color_manual(values=c("JK"="blue","AM"="green","BM"="red"))
+```
+##### Presence/Absence test for effect (group centroids), by `r metadata_col`
+```{r}
+udf <- droplevels(unw_pcoa$df)
+adonis(unw_pcoa$distances ~ BodySite, data=udf)
+```
+
+### Abundance weighted Unifrac plots, colored by `r metadata_col`
+
+```{r}
+wtu_pcoa <- pcoa_1way(mapping_subset, wtu, var=metadata_col)
+wtu_pcoa$plot #+ scale_color_manual(values=c("JK"="blue","AM"="green","BM"="red"))
+```
+##### Weighted test for effect (group centroids), by `r metadata_col`
+```{r}
+wdf <- droplevels(wtu_pcoa$df)
+adonis(wtu_pcoa$distances ~ BodySite, data=wdf)
+```
+
+## Differing taxa by Kruskall-Wallis between `r metadata_col`
+No Significant Differences (underpowered)
+```{r DifferingTaxonAbundance_figure, fig.height=9, echo=FALSE}
+#test_taxon_abundance(mapping_subset, cts, metadata_col, a=a )
+``` 

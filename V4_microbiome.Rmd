@@ -1,0 +1,3781 @@
+---
+title: "V4_microbiome"
+author: "SSM"
+date: "5/18/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+### ================
+###   knitr setup
+### 
+library(knitr)
+opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=8,
+  fig.height=8,
+  fig.align = "center"
+  )
+### ================
+###   R packages
+### 
+library(dplyr)
+library(magrittr)
+library(qiimer)
+library(pander)
+library(ape)
+library(vegan)
+library(ggplot2)
+library(pheatmap)
+library(tidyr)
+library(usedist)
+library(readr)
+library(tibble)
+library(textclean)
+library(pavian)
+
+#Running pavian: pavian::runApp(port=5000)
+```
+### ================
+###   R resources #source("R_functions.R")
+### ================
+###   User defined functions
+```{r 90_percent_assignment_OTU_method, echo=FALSE}
+
+###=====
+###  make_pcoa_plot <- function(uu, s, shape_by, color_by, title)
+###  uu: distance, s: mapping file, shape_by: variable used for shape, color_by: variable used for color
+###=====
+### ================
+###   User defined functions
+### ================
+filter_low_coverage <- function(props, frac_cutoff=0.6, min_ab=0){
+  frac_nonzero <- function (x) sum(x > min_ab) / length(x)
+  apply(props, 1, frac_nonzero) >= frac_cutoff
+}
+
+make_pcoa_plot <- function(dm, s, shape_by, color_by) {
+  dm <- usedist::dist_subset(dm, s$SampleID)
+  pc <- pcoa(dm)
+  pc_df <- merge(s, pc$vectors[, 1:3], by.x="SampleID", by.y="row.names")
+  pc_pct <- round(pc$values$Relative_eig * 100)
+  
+  pcoa_plot = ggplot(pc_df, aes(x=Axis.1, y=Axis.2)) +
+    theme_bw() +
+    scale_shape_discrete(name=sub("_", " ", shape_by)) + 
+    scale_colour_discrete(name=sub("_", " ", color_by)) +
+    labs(
+      x=paste0("PCoA axis 1 (", pc_pct[1], "%)"),
+      y=paste0("PCoA axis 2 (", pc_pct[2], "%)")
+    )
+  
+  if (is.null(shape_by) & !is.null(color_by)) {
+    pcoa_plot <- pcoa_plot + geom_point(aes(colour=factor(get(color_by))))
+  } else if (!is.null(shape_by) & !is.null(color_by)) {
+    pcoa_plot <- pcoa_plot + geom_point(aes(colour=factor(get(color_by)), shape=factor(get(shape_by))))
+  } else {
+    pcoa_plot <- pcoa_plot + geom_point()
+  }
+  return(pcoa_plot)
+}
+
+###=====
+###  heatmap_grouped <- function(genus_props, heatmap_s, grps = c("study_group", "study_day"), fname=NULL, thre=0.8, option=1)
+###  option=1: rows_to_keep <- filter_low_coverage(heatmap_props, perc_cutoff=thre) ## taxa found in at least 80% of samples
+###  option=2: rows_to_keep <- apply(heatmap_props,1,max) >= 0.01 ## taxa with abundance in any sample exceeding 1%
+###=====
+
+heatmap_grouped <- function(summed_props, heatmap_s, grps = c("study_group", "study_day"), fname=NULL, thre=0.8, option=1, prop_cut=0.01, satu_limit=0.4){
+  
+  #color = saturated_rainbow(101)
+  color = saturated_rainbow(101, saturation_limit=satu_limit)
+  breaks = c(0, 1e-10, seq(0.001, 1, length.out = 100))
+  
+  heatmap_props <- summed_props[,heatmap_s$SampleID]
+  
+  if (option == 1) {
+    rows_to_keep <- filter_low_coverage(heatmap_props, frac_cutoff=thre) 
+  } else if (option == 2) {
+    rows_to_keep <- apply(heatmap_props,1,max) >= prop_cut 
+  }
+  heatmap_props <- heatmap_props[rows_to_keep,]
+  
+  ## group the SampleIDs
+  heatmap_s %<>% arrange_(.dots=grps)
+  heatmap_props <- heatmap_props[, heatmap_s$SampleID]
+  
+  ## update the annotation
+  annc <- heatmap_s[,grps] %>% as.data.frame()
+  rownames(annc) <- heatmap_s$SampleID
+  colnames(annc) <- grps
+  
+  ## heatmap time
+  if (!is.null(fname))
+    pheatmap(heatmap_props, annotation = annc, color = color, breaks = breaks, filename = fname, 
+             fontsize_col = 8, fontsize_row = 8, cluster_cols = FALSE, cluster_rows = FALSE,cellheight = 8, cellwidth = 8)
+  else
+    pheatmap(heatmap_props, annotation = annc, color = color, breaks = breaks, 
+             fontsize_col = 8, fontsize_row = 8, cluster_cols = FALSE, cluster_rows = FALSE,cellheight = 8, cellwidth = 8)
+}
+
+
+### ===========================
+###   define constants
+### ===========================
+
+### minimum reads threshold
+min_reads <- 1000
+
+### rarefying subsample size 
+richness_subsample_size <- 1000
+
+### number of samples threshold to show heatmap on the page
+sample_threshold <- 100
+
+### mapping file path
+mapping_file_fp <-file.path("/media/lorax/users/marubel/05_CM_16SV4_Analysis/shotgun_metadata_cameroon_42619.csv") 
+
+### otu table file path
+feature_table_fp <- file.path("/media/lorax/users/marubel/05_CM_16SV4_Analysis/EXPORTED-FEATURE-TABLE/feature-table.tsv")
+
+###modifying top row of featuretable to remove V1 and replace with #OTU ID
+colnames(feature.table.nomitochloro) = feature.table.nomitochloro[1, ]
+feature.table.nomitochloro = feature.table.nomitochloro[-1, ]  
+
+### taxonomic assignment 
+taxo_assignment_fp <- file.path("/media/lorax/users/marubel/05_CM_16SV4_Analysis/EXPORTED-FEATURE-TABLE/taxonomy.tsv")
+
+### unweighted UniFrac file path
+uu_fp <- file.path("/media/lorax/users/marubel/05_CM_16SV4_Analysis/EXPORTED-FEATURE-TABLE/uu_table.tsv")
+
+### weighted UniFrac file path
+wu_fp <- file.path("/media/lorax/users/marubel/05_CM_16SV4_Analysis/EXPORTED-FEATURE-TABLE/wu_table.tsv")
+
+### faith
+faith_fp <- file.path("/media/lorax/users/marubel/05_CM_16SV4_Analysis/EXPORTED-FEATURE-TABLE/faith-alpha-diversity.tsv")
+### ===========================
+###   read in data
+### ===========================
+
+### read mapping file
+s <- read_qiime_mapping_file(mapping_file_fp) 
+###Alt load if mapping file doesn't read in properly
+# s <- read.csv("/media/THING2/louis/15_RubelCameroonShotgun/consign-kegg-r-ator/shotgun_metadata_cameroon_5119.csv",header = TRUE, sep = ",",stringsAsFactors = FALSE)
+
+#s$X <- NULL
+#names(s)[1] <- "SampleID"
+
+###modify mapping file to include ANTS High column (if it doesn't have this already)
+#This builds a new column with any Ascaris, Trichuris, Strongyloides, or Necator sample with high Ct by qPCR as High_Pos_ANTS = Yes..  
+
+#metadata$High_Pos_ANTS <- ifelse(metadata$High_Pos_Trichuris== "Yes" & #!is.na(metadata$High_Pos_Trichuris) | metadata$High_Pos_Ascaris== "Yes" &  
+#!is.na(metadata$High_Pos_Ascaris) | metadata$High_Pos_Necator== "Yes" & !is.na(metadata$High_Pos_Necator) | metadata$High_Pos_Strongyloides== "Yes" & !is.na(metadata$High_Pos_Strongyloides), "1", "0")
+
+#metadata$High_Pos_ANTS <- gsub("1", "Yes", metadata$High_Pos_ANTS)
+#metadata$High_Pos_ANTS <- gsub("0", "No", metadata$High_Pos_ANTS)
+
+### check for the column names to assign color_by and shape_by for pcoa plots
+color_by <- Subsistence
+shape_by <- Ethnicity
+potential_headers <- c("study_group", "SampleType", "study_day", "cage_number")
+header_idx = which(is.element(potential_headers, colnames(s)))
+if(length(header_idx)>0) {
+  color_by <- potential_headers[header_idx[1]]
+}
+if(length(header_idx)>1) {
+  shape_by <- potential_headers[header_idx[2]]
+}
+
+### read otu table
+counts <- readr::read_delim(feature_table_fp, skip=1, delim="\t") %>%
+  column_to_rownames(var = "#OTU ID") %>%
+  as.matrix()
+
+### get read counts
+read_counts <- colSums(counts) %>% 
+  as.data.frame() %>%
+  setNames(c("Read_Counts")) %>%
+  rownames_to_column(var="SampleID")
+
+mean(read_counts[,"Read_Counts"])
+
+###get read counts for just Cameroon and US, no blanks
+#read_counts_USCM <- filter(read_counts_USCM, SampleID!= 'D1296')
+#Do this for all following samples 'EB110', 'EB73', 'EB1', 'EB105', 'EB19', 'EB56', 'EB55', 'PCR1', 'PCR2', 'PCR3', 'PCR4', 'V4GBlock1', 'V4GBlock2', 'V4GBlock3', 'V4GBlock4', "D0056", "D0410","D0523", "D0911", "D0027","D0071", "D0081", "D0785", "D0890", "D0970", "D1193", "D1218", "D1224", "D1250", "D1296" should produce 612 samples
+
+
+### find the samples to keep
+s <- merge(s, read_counts, by="SampleID", all.x=T) %>%
+  mutate(Keep = "Read_Counts" > min_reads) %>%
+  mutate(isControl = grepl("geneblock|freewater|extract", SampleID, ignore.case = TRUE))
+
+### taxonomic assignment
+ta <- read_delim(file=taxo_assignment_fp, delim="\t") %>%
+  mutate(trunc_taxon = sub("(; [kpcofgs]__)+$", "", Taxon, perl=T)) %>%
+  arrange(order(match(rownames(counts), `Feature ID`)))
+
+### check if the order of the assignments and the order of feature table is the same
+if (!all(rownames(counts) == ta$`Feature ID`)) {
+  stop (simpleError("The order of the features in the table and classifications don't match"))
+}
+
+adf <- split_assignments(ta$trunc_taxon) 
+
+### remove contamination
+is_mitochondrial <- grepl("mitochondria", adf$Family)
+is_chloroplast <- grepl("Chloroplast", adf$Class)
+is_unassigned <- grepl("Unassigned", adf$Kingdom)
+is_archaea <- grepl("Archaea", adf$Kingdom)
+is_contam <- is_mitochondrial | is_chloroplast | is_unassigned ### Archaea kept to check positive control samples
+counts <- counts[!is_contam,]
+adf <- adf[!is_contam,]
+ta <- ta[!is_contam,]
+rm(is_contam, is_mitochondrial, is_chloroplast, is_unassigned, is_archaea)
+
+a <- simplify_assignments(adf, rank1="Family", rank2="Genus")
+names(a) <- ta$`Feature ID`
+
+summed_cts <- rowsum(counts, a) 
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+summed_props_ncntrl <-subset(summed_props, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+ncol(summed_props_ncntrl)
+```
+
+```{r}
+###Stuff here to check proportions for single bacteria of interest
+CM_US_metadata <- CM_US_metadata %>% 
+  dplyr::mutate(`Country` = gsub("Industrial","USA",`Subsistence`)) %>% 
+  dplyr::mutate(`Country` = gsub("Pastoralist", "Cameroon", `Country`)) %>%
+  dplyr::mutate(`Country` = gsub("Industrial_Agropastoralist", "USA", `Country`)) %>%
+  dplyr::mutate(`Country` = gsub("Agropastoralist",   
+                                            "Cameroon", `Country`)) %>%
+  dplyr::mutate(`Country` = gsub("Hunter-Gatherer",   
+                                            "Cameroon", `Country`))
+
+grep('Bacteroides', rownames(summed_props))
+summed_props <- as.data.frame(summed_props)
+
+test2 <- summed_props %>% dplyr::slice(50)
+test3 <- bind_rows(test, test2)
+rownames(test2) <- rownames(summed_props)[1:50]
+
+rownames(test2)[1] <- 'Bifidobacteria'
+rownames(test2)[1] <- 'Bifidobacteria'
+
+test2 <- as.data.frame(t(test2))
+test2<- rownames_to_column(test2, var = "sampleID")
+test5 <- left_join(CM_US_metadata, test2, by = "sampleID")
+
+test5 %>% group_by(Population) %>% summarize(median=median(Bifidobacteria))
+
+##phylum test for bacteroidetes to firmicutes 
+b <- simplify_assignments(adf, rank1="Family", rank2 = FALSE)
+names(b) <- ta$`Feature ID`
+
+b <- sub(" +$", "", b) #regex to remove trailing space after taxa
+#ADD A READ IN TO CM_US_METADATA HERE WITH FP FOR THIS TO WORK
+
+summed_cts <- rowsum(counts, b) 
+summed_cts <-subset(summed_cts, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+
+summed_cts <- summed_cts[, -grep("^3", colnames(summed_cts))] #This removes US samples
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props2 <- as.data.frame(t(summed_props))
+#summed_props2 <- summed_props[rowSums(summed_props) >0.01,] #filter on rows that are greater than 1% across all samples
+
+#Do stuff here to CM_US_metadata
+CM_US_metadata$Age <- as.numeric(CM_US_metadata$Age)
+
+CM_US_metadata$age_bins <- 
+    ifelse(CM_US_metadata$Age < 10 & CM_US_metadata$Age > 4, "Early    
+    Childhood", 
+      ifelse(CM_US_metadata$Age > 10 & CM_US_metadata$Age < 18, 
+      "Juvenile", "Adult"))
+
+CM_US_metadata$age_bins <- as.factor(CM_US_metadata$age_bins)
+
+CM_US_metadata$age_bins_LP <- 
+    ifelse(CM_US_metadata$age_bins == "Early Childhood" & CM_US_metadata$Lactose_Phenotype == "LIP", 
+           "EarlyChildhood LP",
+      ifelse(CM_US_metadata$age_bins == "Early Childhood" & CM_US_metadata$Lactose_Phenotype == "LP",
+             "Early Childhood LP",
+             ifelse(CM_US_metadata$age_bins == "Early Childhood" & CM_US_metadata$Lactose_Phenotype == 
+                      "LNP", "Early Childhood LNP",
+                    ifelse(CM_US_metadata$age_bins == "Juvenile" & CM_US_metadata$Lactose_Phenotype == 
+                             "LIP", "Juvenile LP",
+                           ifelse(CM_US_metadata$age_bins == "Juvenile" & CM_US_metadata$Lactose_Phenotype 
+                                  == "LP", "Juvenile LP",
+                                  ifelse(CM_US_metadata$age_bins == "Juvenile" & 
+                                           CM_US_metadata$Lactose_Phenotype   == "LNP", "Juvenile LNP",
+                                         ifelse(CM_US_metadata$age_bins == "Adult" 
+                                                & CM_US_metadata$Lactose_Phenotype =="LIP", "Adult LP",
+                                                ifelse(CM_US_metadata$age_bins == "Adult" & 
+                                                      CM_US_metadata$Lactose_Phenotype == "LP", "Adult LP", ifelse(CM_US_metadata$age_bins == "Adult" & 
+                                                    CM_US_metadata$Lactose_Phenotype == "LNP", "Adult LNP", NA))))))))) 
+
+CM_US_metadata$age_bins_LP <- as.factor(CM_US_metadata$age_bins_LP)
+##
+CM_US_metadata<- CM_US_metadata[!grepl("^U", CM_US_metadata$LabID),] #remove US samples from CM_US_metadata
+
+summed_props3 <- dplyr::mutate(summed_props2, Age = CM_US_metadata$Age)
+rownames(summed_props3) <- rownames(summed_props2)
+
+grouped <- summed_props3 %>% group_by(age_bins_LP) %>% summarise_at(c("f__Bifidobacteriaceae"), funs(median)) 
+
+grouped <- grouped[1:5,]#always double check this for population #s
+
+grouped %>% group_by(Population) %>% summarize(median= median(p__Bacteroidetes))
+
+CM_US_metadata$Age <- as.numeric(CM_US_metadata$Age)
+CM_US_metadata$age_bins <- as.factor(CM_US_metadata$age_bins)
+
+ggplot(mapping=aes(summed_props3$Age, summed_props3$f__Bifidobacteriaceae)) + 
+      geom_point() + 
+      #geom_quasirandom(aes(shape = Afr_qPCR$miseqshape), size = 3) +
+      #scale_shape_manual(values= c(21,17)) +
+      theme_bw(base_size= 18)
+#CM_metadata <- CM_metadata[!(CM_metadata$Subsistence=="Unknown"),]
+#u = uu_fp
+#w = wu_fp
+dist_fp =  wu_fp
+CM_US_metadata <- droplevels(CM_US_metadata)
+w_test  <- usedist::dist_subset(read_qiime_distmat(dist_fp), CM_US_metadata$LabID)
+
+#w_test  <- usedist::dist_subset(read_qiime_distmat(dist_fp), CM_metadata$SampleID)
+CM_US_metadata$age_bins <- as.character(CM_US_metadata$age_bins)
+
+adonis(w_test ~ age_bins, data = CM_US_metadata)
+
+table(Updated_CM_Metadata$Sampling.Site, Updated_CM_Metadata$Subsistence) #
+ # colidx <- match("Population", colnames(df))
+  #df[, -colidx] <- sweep(df[, -colidx], 1, rowSums(df[, -colidx]), "/")
+#  df
+#}
+#grouped <- renorm_by_pop(grouped)
+
+grouped <- as.data.frame(grouped)
+
+groupedmelt <- melt(grouped,value.name ="prop", variable.name = "taxon") 
+
+groupedmelt$taxon <- as.character(groupedmelt$taxon)
+
+groupedmelt <- as.data.frame(groupedmelt)
+
+#test <- groupedmelt %>% dplyr::filter(grepl("f__", variable))
+
+groupedmelt <- groupedmelt %>% dplyr::filter(!grepl("Unassigned", taxon))
+
+groupedfinal <- groupedmelt %>% dplyr::group_by(Population, taxon) %>%
+  dplyr::summarise(prop = sum(prop)) 
+
+
+##This makes a data frame with full taxonomic assignment for LefSe Analysis
+b <-simplify_assignments(adf, rank1="Family", rank2="Genus")
+b <- as.data.frame(b)
+counts <- as.data.frame(counts)
+b$`Taxon` <- ta$`Taxon`
+summed_cts <- rowsum(counts, b$`Taxon`)
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+summed_props<-  as.data.frame(summed_props)
+
+summed_props_1 <-subset(summed_props, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+ncol(summed_props_1) #should show 479
+
+a <- as.data.frame(a)
+counts <- as.data.frame(counts)
+a$`Taxon` <- ta$`Taxon`
+summed_cts <- rowsum(counts, a$`Taxon`)
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+summed_props<-  as.data.frame(summed_props)
+
+summed_props_1 <-subset(summed_props, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+ncol(summed_props_1) #should show 479
+
+summed_cts_2 <- subset(summed_cts, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+ncol(summed_props)#should show 479
+
+#Build in a new metadata column of choice for LefSe Grouping, i.e. ANTS count, Subsistence, etc. 
+```
+### ===========================
+### check for missing samples
+
+```{r}
+### possible issue 1: Samples found in the sample sheet but not in the feature table (0 reads)
+s_missing <- s %>%
+  filter(!SampleID %in% colnames(counts)) %>%
+  select(SampleID, SampleType, isControl)
+
+if (any(!s_missing$isControl)) {
+  pander(filter(s_missing, !isControl), caption="These samples were in the sample sheet but not in the feature table.")
+}
+
+### possible issue 2: Samples found in the feature table but not in the sample sheet. There must be an error!
+in_counts_not_in_s <- setdiff(colnames(counts), s$SampleID)
+if (length(in_counts_not_in_s) > 0) {
+  stop (simpleError("These SampleID(s) are in the feature table, but not found in the sample sheet.", paste(in_counts_not_in_s, collapse=" ")))
+}
+
+s[s$SampleID %in% s_missing$SampleID, "Keep"] <- FALSE
+```
+
+### ===========================
+### Alpha Diversity (calculate and read in)
+```{r}
+faith <- read.delim(file= faith_fp, stringsAsFactors = F) %>%
+  dplyr::rename(SampleID=X)
+
+s <- s %>%
+  merge(diversity(t(counts)), by.x="SampleID", by.y="row.names", all.x=T) %>%
+  dplyr::rename(shannon = y) %>%
+  merge(rarefy(t(counts), richness_subsample_size), by.x="SampleID", by.y="row.names", all.x=T) %>%
+  dplyr::rename(richness = y) %>%
+  merge(faith, by="SampleID", all.x=T)
+### ===========================
+###   extract investigator and run date from the sample sheet
+### ===========================
+
+change_data_format <- function(d) {
+  paste(substr(d,5,6), substr(d,7,8), substr(d,1,4), sep="-")
+}
+all_dates <- as.character(unique(s$run_start_date))
+run_date <- paste(lapply(all_dates, change_data_format), collapse=', ')
+
+investigator <- paste(unique(s$investigators), collapse = ", ")
+Introduction
+This report is based on the results of sequencing performed on r run_date for r investigator Project.
+
+Histogram of high quality paired reads per sample
+The black dashed vertical line shows the minimum number of reads (r min_reads) for analysis. Control samples, if any, were included in the histogram.
+
+ggplot(s, aes(x=Read_Counts)) +
+    geom_histogram(aes(fill=SampleType), binwidth=1000) +
+    geom_vline(xintercept = min_reads, color="black", linetype="dashed") +
+    theme_classic() +
+    theme_bw() + 
+    xlab("Number of reads in sample") +
+    ylab("Number of samples")
+\newpage
+
+Whole samples that are above the r min_reads read count threshold
+pander(table(s[, color_by], factor(ifelse(s$Keep, "Keep", "Discard"))))
+\newpage
+Taxonomic heatmap
+prop_cut <- 0.01
+satu_limit <- 0.4
+heatmap_fp <- "otu_heatmap.pdf"
+show.text <- sum(s$Keep) > sample_threshold
+Each column of the heatmap represents one sample and each row represents one taxon, typically a genus. Taxa were included in the chart if the abundance in any sample exceeded r 100*prop_cut%.
+
+The chart is colored white if taxa were not observed in the sample, dark blue if taxa were observed at very low abundance. This allows the reader to quickly survey presence/absence. Abundance values exceeding r 100*satu_limit% are colored red, indicating an extremely dominant species.
+
+r if(show.text){paste0("Please see attached plot ", heatmap_fp, ".")}
+
+s_toPlot <- s %>%
+  filter(Keep)
+
+props_toPlot <- summed_props[, s_toPlot$SampleID]  
+grps <- c(color_by, shape_by)
+grps <- c("Subsistence", "Ethnicity")
+
+
+### grouped heatmap
+if (dim(s_toPlot)[1] > sample_threshold) {
+  heatmap_grouped(props_toPlot, s_toPlot, grps=grps, thre=0.01, option=2, prop_cut = prop_cut, satu_limit=satu_limit, fname = heatmap_fp)
+} else {
+  heatmap_grouped(props_toPlot, s_toPlot, grps=grps, thre=0.01, option=2, prop_cut = prop_cut, satu_limit=satu_limit)
+}
+\newpage
+
+Alpha Diversity
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of r richness_subsample_size), Shannon index, and Faith’s phylogenetic diversity.
+
+Number of observed OTUs
+alpha_measure <- "richness"
+
+#Subsistence Diversity Below
+s_mod <- read_csv("/media/lorax/users/marubel/05_CM_16SV4_Analysis/EXPORTED-FEATURE-TABLE/s_mod.csv") #Use this formatted mapping file that has 612 samples and no controls
+
+s2 <- s_mod[!is.na(s_mod$Subsistence), ]
+s2 <- as.data.frame(s2)
+#Do this for all following samples 'EB110', 'EB73', 'EB1', 'EB105', 'EB19', 'EB56', 'EB55', 'PCR1', 'PCR2', 'PCR3', 'PCR4', 'V4GBlock1', 'V4GBlock2', 'V4GBlock3', 'V4GBlock4', "D0056", "D0410","D0523", "D0911", "D0027","D0071", "D0081", "D0785", "D0890", "D0970", "D1193", "D1218", "D1224", "D1250", "D1296
+              
+#s2 <- column_to_rownames(s2, var = "SampleID")
+
+#s2<- as.data.frame(t(s2))
+#s3 <- s2[-which(names(s2) %in% c("D0056","D0410","D0523", "D0911", "D0027","D0071", "D0081", "D0785", "D0890", "D0970", "D1193", "D1218", "D1224", "D1250", "D1296")),]
+
+
+ncol(s2)
+
+richness <- s2 %>% #filter(Keep) %>% 
+  ggplot(aes(x=eval(parse(text="Subsistence")), y=eval(parse(text="alpha_measure")), color=eval(parse(text="Subsistence")))) +
+  geom_boxplot() +
+  labs(y= "Richness", x="Subsistence", color="Subsistence") +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  scale_color_manual(values=c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial_Agropastoralist" = "#001d73"))+
+theme(panel.grid.minor.x = element_blank(),
+                    panel.grid.minor.y = element_blank(),
+                    panel.grid.major.x = element_blank(),
+                    panel.grid.major.y = element_blank()) 
+
+#Population and richness
+s2 <- s_mod[!is.na(s_mod$Population), ]
+s2$Population[362] <- "Mbororo_Fulani"
+
+richness <- s2 %>% filter(Keep) %>% 
+  ggplot(aes(x=eval(parse(text="Population")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Population")))) +
+  geom_boxplot() +
+  labs(y= "Richness", x="Population", color="Population") +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) +
+theme(panel.grid.minor.x = element_blank(),
+                    panel.grid.minor.y = element_blank(),
+                    panel.grid.major.x = element_blank(),
+                    panel.grid.major.y = element_blank()) 
+
+#Shannon Index
+alpha_measure <- "shannon"
+
+s2 <- s_mod[!is.na(s_mod$Subsistence), ]
+
+shannon <- s2 %>% filter(Keep) %>%
+  ggplot(aes(x=eval(parse(text="Subsistence")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Subsistence")))) +
+  geom_boxplot() +
+  labs(y="Shannon", x="Subsistence", color="Subsistence") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+scale_color_manual(values=c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial_Agropastoralist" = "#001d73"))
+plot(shannon)
+
+s2 <- s_mod[!is.na(s_mod$Population), ]
+s2$Population[362] <- "Mbororo_Fulani"
+
+shannon <- s2 %>% filter(Keep) %>% 
+  ggplot(aes(x=eval(parse(text="Population")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Population")))) +
+  geom_boxplot() +
+  labs(y= "Shannon", x="Population", color="Population") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5"))
+plot(shannon)
+
+kruskal.test(shannon ~ Subsistence, data = s2)
+
+	Kruskal-Wallis rank sum test
+
+data:  shannon by Subsistence
+Kruskal-Wallis chi-squared = 39.583, df = 3, p-value = 1.306e-08
+
+pairwise.wilcox.test(s2$shannon, s2$Subsistence,
+                 p.adjust.method = "fdr")
+
+s2 %>% group_by(Subsistence) %>% summarize(shannon = mean(shannon))
+s2 %>% group_by(Subsistence) %>% summarize(faith_pd = mean(faith_pd))
+s2 %>% group_by(Subsistence) %>% summarize(richness = mean(richness))
+
+
+#Faith’s Phylogenetic Diversity
+alpha_measure <- "faith_pd"
+
+s2 <- s_mod[!is.na(s_mod$Subsistence), ]
+
+faith <- s2 %>% #filter(Keep) %>%
+  ggplot(aes(x=eval(parse(text="Subsistence")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Subsistence")))) +
+  geom_boxplot() +
+  labs(y="Faith's Phylogenetic Diversity", x="Subsistence", color="Subsistence") +
+  theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+scale_color_manual(values=c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial_Agropastoralist" = "#001d73"))
+plot(faith)
+
+s2 <- s_mod[!is.na(s_mod$Population), ]
+s2$Population[362] <- "Mbororo_Fulani"
+
+faith <- s2 %>% filter(Keep) %>% 
+  ggplot(aes(x=eval(parse(text="Population")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Population")))) +
+  geom_boxplot() +
+  labs(y= "Faith's Phylogenetic Diversity", x="Population", color="Population") +
+theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5"))
+plot(faith)
+
+#ANTS
+s2 <- s_mod[!is.na(s_mod$Total_ANTS), ]
+
+faith <- s2 %>% #filter(Keep) %>% 
+  ggplot(aes(x=eval(parse(text="Total_ANTS")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Total_ANTS")))) +
+  geom_point() +
+  labs(y= "Faith's Phylogenetic Diversity", x="Total_ANTS", color="Total_ANTS") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  geom_smooth(method = lm) 
+
+fitted.model <- lm(faith_pd ~ Subsistence + Total_ANTS, data=s2)
+
+#Total ANTS diversity with a subsistence
+s2 <- s_mod[!is.na(s_mod$Total_ANTS), ]
+#s2 <- s2 %>% filter(s2$Subsistence=="Agropastoralist")#Change this to your subsistence, elimanate entirely for all subs
+temp_combined <- s2 %>% filter(Keep) %>% mutate(Subsistence = "Combined") 
+s2 <- s2 %>% rbind(.,temp_combined) 
+
+s2 <- s2 %>% 
+  mutate(typeSort = factor(s2$Subsistence, levels = c("Agropastoralist","Hunter-Gatherer","Pastoralist","Combined")))
+
+faith <- s2 %>% filter(Keep)%>% #%$% rbind(.,temp_combined)
+  ggplot(aes(x=eval(parse(text="Total_ANTS")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Total_ANTS")))) +
+  geom_point() +
+  labs(y= "Faith's Phylogenetic Diversity", x="Total_ANTS", color="Total_ANTS") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  geom_smooth(method = lm) +
+  facet_grid(. ~ typeSort, scales = "fixed")
+  
+  #geom_abline(intercept = 15.583, slope = 0.3163)#this adds an individual line to an existing graph
+remove(temp_combined)
+
+lm(formula = s2$faith_pd ~ s2$Total_ANTS)
+Call:
+lm(formula = s2$faith_pd ~ s2$Total_ANTS)
+
+Coefficients:
+   (Intercept)  s2$Total_ANTS1  s2$Total_ANTS2  s2$Total_ANTS3  s2$Total_ANTS4  
+      16.08658        -1.19230         0.18885         0.01812         0.82019 
+      
+plot(faith)
+
+I want to know if there are significant differences in diversity between different ANTS category
+
+res.aov <- aov(faith_pd ~Total_ANTS, data= s)
+  Df Sum Sq Mean Sq F value   Pr(>F)    
+Total_ANTS    4    337   84.34   9.763 1.21e-07 ***
+Residuals   569   4915    8.64                     
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+56 observations deleted due to missingness
+
+TukeyHSD(res.aov)
+$Total_ANTS
+           diff        lwr      upr     p adj
+1-0  1.38114337  0.3063374 2.455949 0.0042921
+2-0  1.21042001  0.1901888 2.230651 0.0108065
+3-0  2.01248562  0.9308957 3.094076 0.0000048
+4-0  1.35744128 -0.3411082 3.055991 0.1860661
+2-1 -0.17072336 -1.5185635 1.177117 0.9968974
+3-1  0.63134225 -0.7635190 2.026204 0.7287156
+4-1 -0.02370209 -1.9370425 1.889638 0.9999997
+3-2  0.80206560 -0.5511905 2.155322 0.4839029
+4-2  0.14702127 -1.7362035 2.030246 0.9995364
+4-3 -0.65504433 -2.5722038 1.262115 0.8832028
+HG	15.583	0.3163
+Pastoralist	13.581	2.202
+Agropast	15.5087	0.4176
+
+###ANTS diversity with Richness
+alpha_measure <- "richness"
+
+s2 <- s_mod[!is.na(s_mod$Total_ANTS), ]
+#s2 <- s2 %>% filter(s2$Subsistence=="Agropastoralist")#Change this to your subsistence, elimanate entirely for all subs
+temp_combined <- s2 #%>% filter(Keep) 
+temp_combined <- s2 %>% mutate(Subsistence = "Combined") 
+s2 <- s2 %>% rbind(.,temp_combined) 
+
+s2 <- s2 %>% 
+  mutate(typeSort = factor(s2$Subsistence, levels = c("Agropastoralist","Hunter-Gatherer","Pastoralist","Combined")))
+
+richness <- s2 %>% #filter(Keep)%>% #%$% rbind(.,temp_combined)
+  ggplot(aes(x=eval(parse(text="Total_ANTS")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Total_ANTS")))) +
+  geom_point() +
+  labs(y= "Richness", x="Total_ANTS", color="Total_ANTS") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  geom_smooth(method = lm) +
+  facet_grid(. ~ typeSort, scales = "fixed")
+  
+  #geom_abline(intercept = 15.583, slope = 0.3163)#this adds an individual line to an existing graph
+remove(temp_combined)
+
+lm(formula = s2$richness ~ s2$Total_ANTS)
+
+#Coefficients:
+   (Intercept)  s2$Total_ANTS1  s2$Total_ANTS2  s2$Total_ANTS3  s2$Total_ANTS4  
+       145.990         -15.138           2.246           2.578           8.481  
+
+       plot(richness)
+
+I want to know if there are significant differences in diversity between different ANTS category
+
+res.aov <- aov(richness ~Total_ANTS, data= s)
+
+
+Terms:
+                Total_ANTS Residuals
+Sum of Squares     50716.9  946415.7
+Deg. of Freedom          4       57
+
+Residual standard error: 40.67644
+Estimated effects may be unbalanced
+53 observations deleted due to missingness
+
+summary(res.aov )
+             Df Sum Sq Mean Sq F value  Pr(>F)    
+Total_ANTS    4  50717   12679   7.663 5.1e-06 ***
+Residuals   572 946416    1655                    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+53 observations deleted due to missingness
+
+TukeyHSD(res.aov)
+Total_ANTS
+          diff        lwr      upr     p adj
+1-0  17.660602   2.789284 32.53192 0.0106952
+2-0  16.492059   2.451420 30.53270 0.0120091
+3-0  23.895922   8.930694 38.86115 0.0001437
+4-0  12.375384 -10.686153 35.43692 0.5834565
+2-1  -1.168544 -19.765281 17.42819 0.9998040
+3-1   6.235320 -13.069010 25.53965 0.9028244
+4-1  -5.285218 -31.372257 20.80182 0.9813777
+3-2   7.403863 -11.268056 26.07578 0.8142479
+4-2  -4.116674 -29.739263 21.50591 0.9922373
+4-3 -11.520538 -37.661225 14.62015 0.7479264
+
+###Total ANTS with Shannon
+###ANTS diversity with Richness
+alpha_measure <- "shannon"
+
+s2 <- s_mod[!is.na(s_mod$Total_ANTS), ]
+#s2 <- s2 %>% filter(s2$Subsistence=="Agropastoralist")#Change this to your subsistence, elimanate entirely for all subs
+temp_combined <- s2 #%>% filter(Keep) 
+temp_combined <- s2 %>% mutate(Subsistence = "Combined") 
+s2 <- s2 %>% rbind(.,temp_combined) 
+
+s2 <- s2 %>% 
+  mutate(typeSort = factor(s2$Subsistence, levels = c("Agropastoralist","Hunter-Gatherer","Pastoralist","Combined")))
+
+shannon <- s2 %>% #filter(Keep)%>% #%$% rbind(.,temp_combined)
+  ggplot(aes(x=eval(parse(text="Total_ANTS")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Total_ANTS")))) +
+  geom_point() +
+  labs(y= "Richness", x="Total_ANTS", color="Total_ANTS") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  geom_smooth(method = lm) +
+  facet_grid(. ~ typeSort, scales = "fixed")
+  
+  #geom_abline(intercept = 15.583, slope = 0.3163)#this adds an individual line to an existing graph
+remove(temp_combined)
+
+combined_lm <- lm(formula = s2$shannon ~ s2$Total_ANTS)
+summary(combined_lm)
+
+#Coefficients:
+   (Intercept)  s2$Total_ANTS1  s2$Total_ANTS2  s2$Total_ANTS3  s2$Total_ANTS4  
+       4.08549        -0.16271         0.02726         0.02720         0.11087   
+
+       plot(shannon)
+
+I want to know if there are significant differences in diversity between different ANTS category
+s3 <- s2 %>% group_by(Subsistence) %>% filter(Subsistence == "Hunter-Gatherer") 
+hg_lm <- lm(formula = s3$faith_pd ~ s3$Total_ANTS)
+summary(hg_lm)
+
+What about differences between ANTS and Pops? 
+res.aov <- aov(shannon ~Total_ANTS, data= s)
+
+summary(res.aov )
+  Df Sum Sq Mean Sq F value   Pr(>F)    
+Total_ANTS    4    6.3  1.5742   6.018 9.52e-05 ***
+Residuals   572  149.6  0.2616                     
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+53 observations deleted due to missingness
+
+TukeyHSD(res.aov)
+Total_ANTS
+           diff           lwr       upr     p adj
+1-0  0.19273631  0.0057464540 0.3797262 0.0396247
+2-0  0.17609024 -0.0004547661 0.3526352 0.0509655
+3-0  0.27634332  0.0881726647 0.4645140 0.0006322
+4-0  0.08976002 -0.2002124805 0.3797325 0.9156827
+2-1 -0.01664607 -0.2504788089 0.2171867 0.9996784
+3-1  0.08360701 -0.1591228931 0.3263369 0.8801267
+4-1 -0.10297629 -0.4309910166 0.2250384 0.9116039
+3-2  0.10025308 -0.1345249878 0.3350312 0.7693725
+4-2 -0.08633022 -0.4085050120 0.2358446 0.9486829
+4-3 -0.18658330 -0.5152725986 0.1421060 0.5281021
+
+
+```
+###==================================
+###ANTS Diversity between populations
+###==================================
+```{r}
+s2 <- s_mod[!is.na(s_mod$Total_ANTS), ]
+#s2 <- s2 %>% filter(s2$Subsistence=="Agropastoralist")#Change this to your subsistence, elimanate entirely for all subs
+s2$Population[325] <- 'Mbororo_Fulani'
+#droplevels(s2$Population)
+temp_combined <- s2 %>% filter(Keep) %>% mutate(Population = "Combined") 
+s2 <- s2 %>% rbind(.,temp_combined) 
+
+s2 <- s2 %>% 
+  mutate(typeSort = factor(s2$Population, levels = c("Bagyeli", "Baka","Bantu","Mbororo_Fulani","USA", "Combined")))
+s2 <- s2[!is.na(s2$Population), ]
+
+alpha_measure <- "faith_pd"
+faith <- s2 %>% filter(Keep)%>% #%$% rbind(.,temp_combined)
+  ggplot(aes(x=eval(parse(text="Total_ANTS")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="Total_ANTS")))) +
+  geom_point() +
+  labs(y= "Faith's Phylogenetic Diversity", x="Total_ANTS", color="Total_ANTS") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  geom_smooth(method = lm) +
+  facet_grid(. ~ typeSort, scales = "fixed")
+  
+  #geom_abline(intercept = 15.583, slope = 0.3163)#this adds an individual line to an existing graph
+
+remove(temp_combined)
+
+lm(formula = s2$faith_pd ~ s2$Total_ANTS)
+
+plot(faith)
+
+regress faith's pd on Total ANTS for each subsistence group
+lm(formula = s2$faith_pd )
+#Calculate ANOVA and TUKEY's posthoc on  ANTS/diversity results
+res.aov <- aov(faith_pd ~ as.factor(Total_ANTS), data= s2)
+summary (res.aov)
+TukeyHSD(res.aov)
+
+#Calculate ANOVA and TUKEY's posthoc on pop/diversity results
+grep('Pastoralist', s_mod$Population)
+s_mod$Population[362] <- 'Mbororo_Fulani'
+res.aov <- aov(faith_pd ~ as.factor(Population), data= s_mod)
+summary (res.aov)
+TukeyHSD(res.aov)
+```
+##################
+###HIV Diversity  
+##################
+```{r}
+s2 <- s_mod[!is.na(s_mod$HIV_positive_combokitresult), ]
+#s2 <- s2 %>% filter(s2$Subsistence=="Agropastoralist")#Change this to your subsistence, elimanate entirely for all subs
+temp_combined <- s2 %>% filter(Keep) %>% mutate(Population = "Combined") 
+s2 <- s2 %>% rbind(.,temp_combined) 
+
+s2 <- s2 %>% 
+  mutate(typeSort = factor(s2$Population, levels = c("Bagyeli", "Baka","Bantu","Mbororo_Fulani","USA", "Combined")))
+s2 <- s2[!is.na(s2$Population), ]
+
+faith <- s2 %>% filter(Keep)%>% #%$% rbind(.,temp_combined)
+  ggplot(aes(x=eval(parse(text="HIV_positive_combokitresult")), y=eval(parse(text=alpha_measure)), color=eval(parse(text="HIV_positive_combokitresult")))) +
+  ggbeeswarm::geom_quasirandom() +
+  labs(y= "Faith's Phylogenetic Diversity", x="HIV_positive_combokitresult", color="HIV_positive_combokitresult") +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x=element_text(angle=-25, hjust= .1)) +
+  guides(color=F) +
+  geom_smooth(method = lm) +
+  facet_grid(. ~ typeSort, scales = "fixed")
+
+res.aov <- aov(faith_pd ~ as.factor(Total_ANTS), data= s2)
+summary (res.aov)
+TukeyHSD(res.aov)
+\newpage
+```
+###===============
+###Beta diversity
+###===============
+```{r}
+Similarity between samples was assessed by unweighted and weighted UniFrac distances.
+
+Unweighted UniFrac distances
+dist_fp <- uu_fp
+dist_name <- "unweighted UniFrac distances"
+The r dist_name was employed to compare the species composition of the samples to each other. We used a method of ordination called Principal Coordinates Analysis to select the best 2D coordinate system for display. The percentage in each axis represents the proportion of the total variance captured along the axis.
+
+PCoA plot
+
+#subcolors <- c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial Agropastoralist" = "#999999")
+#s$Sub_Colors <- subcolors[s$Subsistence]
+
+s_toPlot <- s %>%
+    filter(!is.na(Subsistence)) %>% 
+  filter(Keep) %>%
+  filter(!is.na(HIV_positive_combokitresult)) %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(Population!="USA")
+
+#x <- read_tsv("/media/lorax/users/marubel/V4_ANALYSIS/EXPORTED-FEATURE-TABLE/wu_table.tsv", col_names= TRUE)
+
+dist_in <- read_qiime_distmat(dist_fp)
+rownames(s_toPlot) <- s_toPlot$SampleID
+
+dist_in<- usedist::dist_subset(dist_in, c(s_toPlot$SampleID))
+ 
+plot(make_pcoa_plot(dist_in, s_toPlot, col= c("Subsistence"), shape_by="HIV_positive_combokitresult")) 
+
+pc <- pcoa(dist_in)
+pc_df <- merge(s_toPlot, pc$vectors[, 1:3], by.x="SampleID", by.y="row.names")
+pc_pct <- round(pc$values$Relative_eig * 100)
+
+ggplot(pc_df, aes(x=Axis.1, y=Axis.2, shape=HIV_positive_combokitresult, color=Subsistence)) +
+  theme_bw(base_size= 20) +
+  geom_point(size = 5) +
+  scale_color_manual(values=c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial Agropastoralist" = "#001d73")) +
+  scale_shape_manual(values=c("Positive" = 15, "Negative" = 1, "NA" = 21)) +
+  scale_size_manual(values=c(50,2))+
+#geom_text(aes(label=ifelse(HIV_positive_combokitresult=="Positive",as.character(SampleID),'')),hjust=0,vjust=0)+
+  labs(
+    x=paste0("PCoA axis 1 (", pc_pct[1], "%)"),
+    y=paste0("PCoA axis 2 (", pc_pct[2], "%)")
+  )
+  
+#Weighted Unifrac/HIV below
+dist_fp <- wu_fp
+dist_name <- "weighted UniFrac distances"
+dist_in <- read_qiime_distmat(dist_fp)
+
+dist_in<- usedist::dist_subset(dist_in, c(s_toPlot$SampleID))
+pc <- pcoa(dist_in)
+pc_df <- merge(s_toPlot, pc$vectors[, 1:3], by.x="SampleID", by.y="row.names")
+pc_pct <- round(pc$values$Relative_eig * 100)
+
+ggplot(pc_df, aes(x=Axis.1, y=Axis.2, shape=HIV_positive_combokitresult, color=Subsistence)) +
+  theme_bw(base_size= 20) +
+  geom_point(size = 5) +
+  scale_color_manual(values=c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial Agropastoralist" = "#001d73")) +
+  scale_shape_manual(values=c("Positive" = 15, "Negative" = 1, "NA" = 21)) +
+  scale_size_manual(values=c(50,2))+
+#geom_text(aes(label=ifelse(HIV_positive_combokitresult=="Positive",as.character(SampleID),'')),hjust=0,vjust=0)+
+  labs(
+    x=paste0("PCoA axis 1 (", pc_pct[1], "%)"),
+    y=paste0("PCoA axis 2 (", pc_pct[2], "%)")
+  )
+ 
+\newpage
+```
+###
+###UPGMA clustering
+###================
+```{r}
+The following plot shows sample clustering based on r dist_name. We have used a method of hierarchical clustering called "average-linkage" or UPGMA. At the bottom of the dendrogram, all samples start out in their own group. Moving up the dendrogram, samples accumulate into clusters if the average (mean) distance between all samples is below the indicated value.
+
+hc = hclust(dist_in, method="average")
+plot(hc, main=paste0("UPGMA linkage clustergram based on\n", dist_name), xlab="Sample ID", ylab="distance", sub = "")
+\newpage
+
+Weighted UniFrac distances
+dist_fp <- wu_fp
+dist_name <- "weighted UniFrac distances"
+The r dist_name was employed to compare the species composition of the samples to each other. We used a method of ordination called Principal Coordinates Analysis to select the best 2D coordinate system for display. The percentage in each axis represents the proportion of the total variance captured along the axis.
+
+PCoA plot
+s_toPlot <- s %>% filter(!is.na(Total_Positive_Parasites))%>%
+  filter(Keep) %>%
+  filter(!isControl)
+
+dist_in <- usedist::dist_subset(read_qiime_distmat(dist_fp), s_toPlot$SampleID)
+plot(make_pcoa_plot(dist_in, s_toPlot, color_by="Total_Positive_Parasites", shape_by=NULL))
+\newpage
+
+UPGMA clustering
+The following plot shows sample clustering based on r dist_name. We have used a method of hierarchical clustering called "average-linkage" or UPGMA. At the bottom of the dendrogram, all samples start out in their own group. Moving up the dendrogram, samples accumulate into clusters if the average (mean) distance between all samples is below the indicated value.
+
+hc = hclust(dist_in, method="average")
+plot(hc, main=paste0("UPGMA linkage clustergram based on\n", dist_name), xlab="", ylab="distance", sub = "")
+\newpage
+
+APPENDIX: Counts of high quality paired reads for each sample
+s %>% 
+  select(SampleID, Read_Counts, final_library_concentration_ng_ul) %>% 
+  arrange(-Read_Counts) %>% 
+  pander()
+```
+###PERMANOVA
+###====================
+```{r}
+#Technically this is adonis, which is like a parallel implementation of PERMANOVA but is better for several reasons- key here, I can run continuous and categorical variables by keeping categorical as.character and continuous as as.numeric. 
+
+Updated_CM_Metadata <-read.delim("/media/lorax/users/marubel/V4_ANALYSIS/shotgun_metadata_cameroon_42619.csv", sep=",", header=TRUE) 
+
+Updated_CM_Metadata <- as.data.frame(Updated_CM_Metadata)
+Updated_CM_Metadata$X <- NULL
+
+colnames(Updated_CM_Metadata)[1] <- "SampleID"
+#Updated_CM_Metadata_t <- Updated_CM_Metadata[,-1]
+rownames(Updated_CM_Metadata) <- Updated_CM_Metadata[,1]
+Updated_CM_Metadata <- Updated_CM_Metadata %>%
+  filter(grepl("^D", SampleID))
+ #currently has sampleIDs as columns
+Updated_CM_Metadata <- Updated_CM_Metadata[!Updated_CM_Metadata$SampleID %in% c('D0027','D0056','D0071','D0081','D0410','D0523','D0785','D0890','D0911','D0970','D1193','D1218','D1224','D1250','D1296'),]
+
+Updated_CM_Metadata <- Updated_CM_Metadata[!Updated_CM_Metadata$SampleID %in% c('D0027','D0056','D0071','D0081','D0410','D0523','D0785','D0890','D0911','D0970','D1193','D1218','D1224','D1250','D1296','EB110', 'EB73', 'EB1', 'EB105', 'EB19', 'EB56', 'EB55', 'PCR1', 'PCR2', 'PCR3', 'PCR4', 'V4GBlock1', 'V4GBlock2', 'V4GBlock3', 'V4GBlock4', 'EB119','EB3','EB47','EB75','LibNeg1','LibNeg2','cytokine_high20-557',  'cytokine_high564-1293','cytokine_low20_557','cytokine_low564_1293'),]
+
+
+eastcities <- list("Bosquet", "Nkolbikong", "Missoume", "Aviation", "Njibot")
+southcities <- list('Bidou_I', 'Ndtoua')
+northwestcities <- list('Ntambang', 'Sabga')
+
+Updated_CM_Metadata$Region <- mgsub(Updated_CM_Metadata$Sampling.Site, eastcities, "East")
+Updated_CM_Metadata$Region <- mgsub(Updated_CM_Metadata$Region, southcities, "South") 
+Updated_CM_Metadata$Region <- mgsub(Updated_CM_Metadata$Region, northwestcities, "Northwest")
+#Updated_CM_Metadata <- as.data.frame(t(Updated_CM_Metadata))
+Updated_CM_Metadata$Bantu_region <- NA
+Updated_CM_Metadata$Bantu_region <- with(Updated_CM_Metadata, ifelse(Population =="Bantu" & Region =="South", "Bantu_S", Bantu_region))
+Updated_CM_Metadata$Bantu_region <- with(Updated_CM_Metadata, ifelse(Population =="Bantu" & Region =="East", "Bantu_E", Bantu_region))
+Updated_CM_Metadata$Bantu_region <- with(Updated_CM_Metadata, ifelse(Population =="Bantu" & Region =="Northwest", "Bantu_NW", Bantu_region))
+
+#Updated_CM_Metadata$Country <- NA
+#Updated_CM_Metadata$Country <- mgsub(Updated_CM_Metadata$Population, "Agropastoralist", "USA") 
+#Updated_CM_Metadata$Country <- with(Updated_CM_Metadata, ifelse(Population =="Bantu"|Population =="Bagyeli"|Population =="Baka"|Population =="Mbororo_Fulani"|Population =="Pastoralist", "Cameroon", Country))
+#Updated_CM_Metadata$Country <- as.character(Updated_CM_Metadata$Country) 
+
+Updated_CM_Metadata$Lactose_Phenotype <- mgsub(Updated_CM_Metadata$Lactose_Phenotype, "LIP", "LP") 
+
+Updated_CM_Metadata$Bantu_region <- as.character(Updated_CM_Metadata$Bantu_region)
+Updated_CM_Metadata$HIV_positive_combokitresult <- as.character(Updated_CM_Metadata$HIV_positive_combokitresult)
+Updated_CM_Metadata$PosOrNeg_Trichuris <- as.character(Updated_CM_Metadata$PosOrNeg_Trichuris)
+Updated_CM_Metadata$PosOrNeg_Strongyloides <- as.character(Updated_CM_Metadata$PosOrNeg_Strongyloides)
+Updated_CM_Metadata$PosOrNeg_PanCrypto <- as.character(Updated_CM_Metadata$PosOrNeg_PanCrypto)
+Updated_CM_Metadata$PosOrNeg_Giardia <- as.character(Updated_CM_Metadata$PosOrNeg_Giardia)
+Updated_CM_Metadata$PosOrNeg_Ascaris <- as.character(Updated_CM_Metadata$PosOrNeg_Ascaris)
+Updated_CM_Metadata$PosOrNeg_Entamoeba <- as.character(Updated_CM_Metadata$PosOrNeg_Entamoeba)
+Updated_CM_Metadata$PosOrNeg_Ancylostoma <- as.character(Updated_CM_Metadata$PosOrNeg_Ancylostoma)
+Updated_CM_Metadata$Lactose_Phenotype <- as.character(Updated_CM_Metadata$Lactose_Phenotype)
+Updated_CM_Metadata$Eosinophil <- as.character(Updated_CM_Metadata$Eosinophile)
+Updated_CM_Metadata$Bantu_ANTS <- as.character(Updated_CM_Metadata$Bantu_ANTS)
+Updated_CM_Metadata$High_Pos_ANTS <- as.character(Updated_CM_Metadata$High_Pos_ANTS)
+Updated_CM_Metadata$High_Pos_Trichuris <- as.character(Updated_CM_Metadata$High_Pos_Trichuris)
+Updated_CM_Metadata$High_Pos_Strongyloides <- as.character(Updated_CM_Metadata$High_Pos_Strongyloides)
+Updated_CM_Metadata$High_Pos_Ascaris <- as.character(Updated_CM_Metadata$High_Pos_Ascaris)
+Updated_CM_Metadata$High_Pos_Giardia <- as.character(Updated_CM_Metadata$High_Pos_Giardia)
+Updated_CM_Metadata$High_Pos_Entamoeba <- as.character(Updated_CM_Metadata$High_Pos_Entamoeba)
+Updated_CM_Metadata$High_Pos_Necator <- as.character(Updated_CM_Metadata$High_Pos_Necator)
+Updated_CM_Metadata$High_Pos_Crypto <- as.character(Updated_CM_Metadata$High_Pos_Crypto)
+Updated_CM_Metadata$Total_Parasites <- as.character(Updated_CM_Metadata$Total_Parasites)
+Updated_CM_Metadata$Total_Parasites_HIV <- as.character(Updated_CM_Metadata$Total_Parasites_HIV)
+Updated_CM_Metadata$Total_Parasites_HIV_BloodParasites <- as.character(Updated_CM_Metadata$Total_Parasites_HIV_BloodParasites)
+Updated_CM_Metadata$Total_Parasites_BloodParasites <- as.character(Updated_CM_Metadata$Total_Parasites_BloodParasites)
+Updated_CM_Metadata$Total_ANTS <- as.character(Updated_CM_Metadata$Total_ANTS)
+Updated_CM_Metadata$Age <- as.numeric(Updated_CM_Metadata$Age)
+Updated_CM_Metadata$Sex <- as.character(Updated_CM_Metadata$Sex)
+Updated_CM_Metadata$BMI <- as.numeric(Updated_CM_Metadata$BMI)
+Updated_CM_Metadata$Height_cm <- as.numeric(Updated_CM_Metadata$Height_cm)
+Updated_CM_Metadata$Weight <- as.numeric(Updated_CM_Metadata$Weight)
+Updated_CM_Metadata$ants_binary <- as.character(Updated_CM_Metadata$ants_binary)
+
+
+Updated_CM_Metadata[is.na(Updated_CM_Metadata)] <- "Unknown" #this globally changes s_edited "NA" to "unknown"
+
+Updated_CM_Metadata$Sex[253] <- "Unknown"
+
+Updated_CM_Metadata$Eosinophil[161] <- "Unknown"
+
+levels(Updated_CM_Metadata$PosOrNeg_Necator)[levels(Updated_CM_Metadata$PosOrNeg_Necator)== NA] <- "Unknown"
+
+#Updated_CM_Metadata$PosOrNeg_Necator[345] <- "Negative"
+CM_metadata <- Updated_CM_Metadata
+CM_metadata$Subsistence[325] <- "Pastoralist"
+CM_metadata$Subsistence <- mgsub(CM_metadata$Subsistence, "Agropastoralist", "not_P")
+CM_metadata$Subsistence <- mgsub(CM_metadata$Subsistence, "Hunter-Gatherer", "not_P")
+
+
+CM_metadata <- CM_metadata[!(CM_metadata$Subsistence=="Unknown"),]
+#u = uu_fp
+#w = wu_fp
+dist_fp =  uu_fp
+CM_metadata <- droplevels(CM_metadata)
+u_test  <- usedist::dist_subset(read_qiime_distmat(dist_fp), CM_metadata$SampleID)
+
+#w_test  <- usedist::dist_subset(read_qiime_distmat(dist_fp), CM_metadata$SampleID)
+CM_metadata$Subsistence <- as.character(CM_metadata$Subsistence)
+
+adonis(u_test ~ Subsistence, data = CM_metadata)
+
+table(Updated_CM_Metadata$Sampling.Site, Updated_CM_Metadata$Subsistence) #use this scaffold to test out 0's in sampleIDs to categories; these will throw errors in the code because there's nothing to test, i.e., U.S. for most variables 
+
+s_edited$HIV_positive_combokitresult[is.na(s_edited$HIV_positive_combokitresult)] <- "Unknown" #this makes NAs into 0s
+
+adonis(u_test~ Bantu_region + Sampling.Site, data=Updated_CM_Metadata)
+
+adonis2(formula, data, permutations = 999, method = "bray",
+    sqrt.dist = FALSE, add = FALSE, by = "terms",
+    parallel = getOption("mc.cores"), ...)
+adonis(formula, data, permutations = 999, method = "bray",
+    strata = NULL, contr.unordered = "contr.sum",
+    contr.ordered = "contr.poly", parallel = getOption("mc.cores"), ...)
+
+adonis(uu_fp ~ ., env, na=na.omit, subset = complete.cases(ind))
+
+adonis(uu_fp ~ study_population + Sampling.Site, data = s)
+
+#Pairwise testing of PERMANOVA
+library(usedist)
+library(plyr)
+library(tidyr)
+library(vegan)
+
+#Ceylan's function for pairwise comparisons on a single dependent variable below
+tidy_permanova <- function(anov){
+  data.frame(Term = rownames(anov$aov.tab), anov$aov.tab, row.names = NULL) %>%
+    rename(p.value = Pr..F.)
+}
+
+## run the test
+permanova_test <- function(dist_matrix, s_toTest, group_label, perm){
+  dist_matrix <- dist_subset(dist_matrix, s_toTest$SampleID)
+  form1 <- paste("dist_matrix", "~", group_label)
+  tidy_permanova(adonis(as.formula(form1), data=s_toTest, permutations=perm))
+}
+
+
+permanova_test <- function(dist_matrix, s_toTest, group_label, perm){
+  dist_matrix <- dist_subset(dist_matrix, s_toTest$SampleID)
+  form1 <- paste("dist_matrix", "~", group_label)
+  tidy_permanova(adonis(as.formulat(form1), data=s_toTest, permutations=perm))
+}
+
+permanova_posthoc <- function(dist_matrix, s_toTest, group_label, perm, p_cutoff=0.05){
+  a_ixn <- permanova_test(dist_matrix, s_toTest, group_label, perm=perm)[1,]
+  combs <- combn(as.character(unique(s_toTest[[group_label]])), 2)
+  num_tests <- dim(combs)[2]
+  
+  # do post hoc tests
+  if (a_ixn$p.value < p_cutoff) {
+    post_hocs <- lapply(1:num_tests,
+                        function(x) data.frame(comparison = paste(combs[,x], collapse=' - '),
+                                               permanova_test(dist_matrix, s_toTest[is.element(s_toTest[[group_label]], combs[,x]),], group_label, perm=perm) ))
+    a_ixn <- rbind(data.frame(comparison="all", a_ixn), do.call(rbind, post_hocs))
+  }
+  a_ixn
+}
+test <- adonis(u_test ~ Sampling.Site + Subsistence + Population + BMI + Ave_BP_Sys + Ave_BP_Dia + Ave_BP_HR + Oximeter_Oxygen_Saturation + Ave_Temp + Hemoglobin_g_per_dL + WBC + Age + HIV_positive_combokitresult + Neutrophile + Monocyte + Lymphocyte + Eosinophil + Total_Parasites + Total_Parasites_HIV + Total_Parasites_HIV_BloodParasites + Total_Parasites_BloodParasites + PosOrNeg_Trichuris + PosOrNeg_Strongyloides + PosOrNeg_PanCrypto + PosOrNeg_Ascaris + PosOrNeg_Giardia + PosOrNeg_Entamoeba + PosOrNeg_Necator + Lactose_Phenotype, data = Updated_CM_Metadata)
+```
+###Regression analysis
+###===================
+```{r}
+library(dplyr)
+library(Hmisc)
+
+#inspect data types, levels
+str(Cameroon_metadata_6418_5$Subsistence)
+dim(corr3$r)
+unique(Cameroon_metadata_6418_5$Subsistence)
+as.factor(Cameroon_metadata_6418_5$Subsistence)
+Cameroon_metadata_6418_5$Subsistence[1]
+
+#Convert categorical levels to numerical for correlation analysis in hmisc, which doesn't like mixed numerical and categorical. Categorical cannot have NAs!
+Cameroon_metadata_6418_6$sampleID <-NULL
+Cameroon_metadata_6418_7$PosOrNeg_Crypto <-NULL
+Cameroon_metadata_6418_7$CopiesPerUlSample_Crypto<-NULL
+Cameroon_metadata_6418_7$Basophile<-NULL
+Cameroon_metadata_6418_7$X <-NULL
+Cameroon_metadata_6418_7$Ave_Breath_Hydrolyzer <-NULL
+Cameroon_metadata_6418_7$W_bancrofti <-NULL
+
+
+pheatmap(is.nan(corr3$r), cluster_rows = F, cluster_cols = F) #great way to visualize problem NA values between columns of data
+
+Cameroon_metadata_6418_7$Longtiude <- transform(Cameroon_metadata_6418_6$Longtiude, 
+                                                 
+Cameroon_metadata_6418_7$Longtiude <- sapply(Cameroon_metadata_6418_6$Longtiude, as.factor)
+
+levels(as.factor(Cameroon_metadata_6418_5$Subsistence))
+level_key <- list("Agropastoralist" = 1, "Hunter_Gatherer" = 2, "Pastoralist" = 3)
+recode(Cameroon_metadata_6418_5$Subsistence, !!!level_key)
+
+#run rcorr on modified dataset that should now be all numerical 
+corr2 <- rcorr(as.matrix(Cameroon_metadata_6418_5, type = c("spearman")))
+
+#visualize results as a correlation plot 
+corrplot(corr3$r, type="upper", order="hclust", p.mat = corr3$P, sig.level = 0.01, insig = "blank", tl.cex  = .75, tl.col="black")
+
+#This skips coolumn 24, which has a problematic set of values
+colnames(Cameroon_metadata_6418_7)[24] #what is column 24
+corr3 <- rcorr(as.matrix(Cameroon_metadata_6418_8[, c(1:23, 25:ncol(Cameroon_metadata_6418_8))]), type = c("spearman"))
+#Key for Cameroon_metadata_6418_6.txt 
+#Ethnicity: Baka 1 Bagyeli 2 Bantu 3 Mbororo Fulani 4
+#Subsistence: Agropastoralist 1 Hunter Gatherer 2 Pastoralist 3
+#Lactose Phenotype: LNP 1 LIP 2 LP 3
+#All pos or neg categories: Positive 1 Negative 2
+#Sex: Female 1 Male 2
+#Sampling.Site Missoume 1 Aviation 2 Njibot 3 Nkolbikong 4 Bosquet 5 Bidou I 6 Ndtoua 7 Sabga 8 Ntambang 9
+
+data(tea)
+ res.mca <- MCA(tea,quanti.sup=19,quali.sup=20:36)
+ summary(res.mca)
+ plot(res.mca,invisible=c("var","quali.sup","quanti.sup"),cex=0.7)
+ plot(res.mca,invisible=c("ind","quali.sup","quanti.sup"),cex=0.8)
+ plot(res.mca,invisible=c("quali.sup","quanti.sup"),cex=0.8)
+ dimdesc(res.mca)
+ plotellipses(res.mca,keepvar=1:4)
+ plotellipses(res.mca,keepvar="Tea")
+ 
+ data(hobbies)
+res.mca <- MCA(hobbies,quali.sup=19:22,quanti.sup=23)
+plot(res.mca,invisible=c("ind","quali.sup"),hab="quali") 
+plot(res.mca,invisible=c("var","quali.sup"),cex=.5,label="none") 
+plot(res.mca,invisible=c("ind","var"),hab="quali")
+dimdesc(res.mca)
+plotellipses(res.mca,keepvar=1:4)
+
+```
+
+###
+###PHYLOSEQ
+###==============================
+```{r}
+Use phyloseq to build pcoa plots featuring gradient of color on one taxa###
+library(phyloseq)
+library(ggplot2)
+library(qiimer)
+#Remove blanks/pos controls from counts in new df 
+counts2 <- counts
+counts2 <- as.data.frame(counts2)
+
+counts2 <- subset(counts2, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+
+counts2 <- as.matrix(counts2)
+
+counts3 <-counts2
+counts3 <-subset(counts3, select = -c(D0911, D0523, D0056))
+counts3 <- as.matrix(counts3)
+#check that rownames are the same between taxonomic table and otu counts
+Updated_CM_Metadata <-read.delim("/media/lorax/users/marubel/05_CM_16SV4_Analysis/shotgun_metadata_cameroon_42619.csv", sep=",", header=TRUE) 
+
+Updated_CM_Metadata <-as.data.frame(Updated_CM_Metadata)
+Updated_CM_Metadata$X <- NULL
+colnames(Updated_CM_Metadata)[1] <- "SampleID"
+Updated_CM_Metadata_t <- Updated_CM_Metadata[,-1]
+rownames(Updated_CM_Metadata_t) <- Updated_CM_Metadata[,1]
+Updated_CM_Metadata_t <- as.data.frame(t(Updated_CM_Metadata_t))
+Updated_CM_Metadata_t <- subset(Updated_CM_Metadata_t, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4, EB119,EB3,EB47,EB75,LibNeg1,LibNeg2,`cytokine_high20-557`,`cytokine_high564-1293`,`cytokine_low20_557`,`cytokine_low564_1293`,D0027,D0056,D0071,D0081,D0410,D0523,D0785,D0890,D0911,D0970,D1193,D1218, D1224,D1250,D1296)) #currently has sampleIDs as columns
+ 
+CM_US_metadata1 <- as.data.frame(t(Updated_CM_Metadata_t))
+
+CM_US_metadata <- CM_US_metadata1 %>% 
+  mutate(`Lactose_Binary` = str_replace(`Lactose_Phenotype`, "LIP", "LP")) 
+
+rownames(CM_US_metadata) <- rownames(CM_US_metadata1)
+CM_US_metadata$Lactose_Binary <- factor(CM_US_metadata$Lactose_Binary, levels = c("LP", "LNP"))
+droplevels(CM_US_metadata$Lactose_Binary)
+
+#metadata_IDs_filtered2 <- CM_US_metadata
+#metadata_IDs_filtered2$sampleID <- rownames(metadata_IDs_filtered2)
+
+#metadata_IDs_filtered2 <- CM_US_metadata %>% filter(is.na(Lactose_Binary))
+
+CM_US_metadata$Subsistence <- factor(CM_US_metadata$Subsistence, levels= c("Agropastoralist", "Industrial_Agropastoralist", "Hunter-Gatherer", "Pastoralist"))
+CM_US_metadata$Subsistence[362] <- "Pastoralist"
+CM_US_metadata$Subsistence[1:37] <- "Industrial_Agropastoralist"
+
+droplevels(CM_US_metadata$Subsistence)
+
+CM_US_metadata$Population <- factor(CM_US_metadata$Population, levels= c("Baka", "Bantu", "Mbororo_Fulani", "Bagyeli", "USA"))
+CM_US_metadata$Population[1:37] <- "USA"
+#droplevels(CM_US_metadata$Population)
+
+#CM_US_metadata$Ethnicity[1:37]<-CM_US_metadata$Sampling.Site[1:37]
+CM_US_metadata$Sampling.Site <- factor(CM_US_metadata$Sampling.Site, levels= c("USA", "Aviation", "Bidou_I", "Bosquet", "Missoume", "Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga"))
+#CM_US_metadata$Sampling.Site<- droplevels(CM_US_metadata$Sampling.Site)
+CM_US_metadata$Sampling.Site[1:37]<- "USA"
+
+CM_US_metadata$Sampling.Site <- factor(CM_US_metadata$Sampling.Site, levels= c("USA", "Aviation", "Bidou_I", "Bosquet", "Missoume", "Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga"))
+CM_US_metadata$Sampling.Site[1:37]<- "USA"
+#CM_US_metadata$Sampling.Site<- #droplevels(CM_US_metadata$Sampling.Site)
+
+CM_US_metadata$sampleID <- rownames(CM_US_metadata)
+
+Bantuslice <- dplyr::select(CM_US_metadata, Population, Sampling.Site, sampleID) %$% filter(., Population == "Bantu")
+
+CM_US_metadata$Country <- mgsub(CM_US_metadata$Population, "USA", "USA")
+
+CM_US_metadata$Country <- mgsub(CM_US_metadata$Population, c("Bantu", "Baka","Bagyeli","Mbororo_Fulani"), "Cameroon")
+CM_US_metadata$Country[362] <- c("Cameroon")
+
+eastcities <- list("Bosquet", "Nkolbikong", "Missoume", "Aviation", "Njibot")
+southcities <- list('Bidou_I', 'Ndtoua')
+northwestcities <- list('Ntambang', 'Sabga')
+
+CM_US_metadata$Region <- mgsub(CM_US_metadata$Sampling.Site, eastcities, "East")
+CM_US_metadata$Region <- mgsub(CM_US_metadata$Region, southcities, "South") 
+CM_US_metadata$Region <- mgsub(CM_US_metadata$Region, northwestcities, "Northwest")
+
+
+CM_US_metadata$Bantu_region <- NA
+CM_US_metadata$Bantu_region <- with(CM_US_metadata, ifelse(Population =="Bantu" & Region =="South", "Bantu_S", Bantu_region))
+CM_US_metadata$Bantu_region <- with(CM_US_metadata, ifelse(Population =="Bantu" & Region =="East", "Bantu_E", Bantu_region))
+CM_US_metadata$Bantu_region <- with(CM_US_metadata, ifelse(Population =="Bantu" & Region =="Northwest", "Bantu_NW", Bantu_region))
+
+#Check that rows in counts2 do not = 0s (i.e., that dropping sampleIDs didn't remove the only count/counts for a given ASV)
+counts4 <- counts3[rowSums(counts3)>0,] #ASVs should change from 14138 to 13816
+indx_cts3 <- rowSums(counts4)>0 
+ta3 <- ta[indx_cts3,]
+
+#Jesse- you can just modify indx_cts3 to be rowSums(counts3)>0 so it's a working index vector on the full-length variables (instead of rowSums(counts4) which'll be working with a shortened form already).  You need a vector that has one logical value for every position in the original ta/counts, so it'll need to be 14138 long, with 13808 TRUE and the rest FALSE.  Then after doing ta[indx_cts3, ] you'll only have 13808 rows in ta3.  Does that make sense?
+indx_cts3 <- rowSums(counts3)>0
+counts4 <- counts3[indx_cts3,]
+ta3 <- ta[indx_cts3,]
+
+if(!all((ta3$`Feature ID`)==((rownames(counts4))))) stop("Row names don't match")
+
+#Only include ASVs in ta that match ASVs in counts2 
+
+ta3 <- as.data.frame(ta3)
+ta3 <- split_assignments(ta3$trunc_taxon)
+rownames(ta3) <-rownames(counts4)
+
+
+ta3 <- as.matrix(ta3)
+counts4 <- as.matrix(counts4)
+
+OTU = otu_table(counts4, taxa_are_rows = TRUE)
+TAX = tax_table(ta3)
+physeq = phyloseq(OTU, TAX)
+physeq
+#plot_bar(physeq, fill = "Family")  
+
+#Add sample data to the combined dataset. Make sure that the sample names match the sample_names of the otu_table.
+#CM_US_metadata <- as.data.frame(t(CM_US_metadata_t))
+
+sampledata2 = sample_data(data.frame(CM_US_metadata,
+  row.names=sample_names(physeq),
+  stringsAsFactors=FALSE
+))
+```
+
+```{r}
+
+
+physeq1 = merge_phyloseq(physeq, sampledata2)
+physeq1
+
+dist_bray <- distance(physeq1, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+ord_bray <- ordinate(physeq1, method="PCoA", distance=dist_bray)
+
+Pop_BC<-plot_ordination(Banturegion_subset, ord_bray, color="Bantu_region") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu_NW" = "#ffcc99", "Bantu_E" = "#999FFF", "Bantu_S" = "#a9315c")) + theme_bw()
+
+adonis(distance(physeq1, method="bray",) ~Sex, data=CM_US_metadata)
+
+
+#Subsets data only into Bantu 
+Banturegion_subset <- subset_samples(physeq1, Bantu_region%in%c("Bantu_NW","Bantu_E","Bantu_S"))
+dist_bray <- distance(Banturegion_subset, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+ord_bray <- ordinate(Banturegion_subset, method="PCoA", distance=dist_bray)
+
+Pop_BC<-plot_ordination(Banturegion_subset, ord_bray, color="Bantu_region") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu_NW" = "#ffcc99", "Bantu_E" = "#999FFF", "Bantu_S" = "#a9315c")) + theme_bw()
+
+adonis(distance(Banturegion_subset, method="bray",) ~ Bantu_region, data=CM_US_metadata)
+
+Bantu_ANTS_subset <- subset_samples(physeq1, Bantu_ANTS%in%c("No","Yes"))
+dist_bray <- distance(Bantu_ANTS_subset, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+ord_bray <- ordinate(Bantu_ANTS_subset, method="PCoA", distance=dist_bray)
+
+Pop_BC<-plot_ordination(Bantu_ANTS_subset, ord_bray, color="Bantu_ANTS") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Yes" = "#ffcc99", "No" = "#999FFF")) + theme_bw()
+
+adonis(distance(Bantu_ANTS_subset, method="bray",) ~  Sampling.Site, Bantu_ANTS, data=CM_US_metadata)
+
+
+Banturegion_subset <- subset_samples(physeq1, Bantu_region%in%c("Bantu_E","Bantu_S"))
+dist_bray <- distance(Banturegion_subset, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+ord_bray <- ordinate(Banturegion_subset, method="PCoA", distance=dist_bray)
+
+Pop_BC<-plot_ordination(Banturegion_subset, ord_bray, color="Bantu_region", shape="Bantu_ANTS") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu_NW" = "#ffcc99", "Bantu_E" = "#999FFF", "Bantu_S" = "#a9315c")) + theme_bw()
+
+adonis(distance(Banturegion_subset, method="bray",) ~ Bantu_ANTS, data = x)
+x <- sample_data(Banturegion_subset) %>% as.data.frame()
+x <- x %>% select(sampleID, Bantu_ANTS, Bantu_region)
+x <- as.data.frame(as.matrix(x))
+
+
+TopNOTUs = names(sort(taxa_sums(Banturegion_subset), TRUE)[1:15])
+ent15 = prune_taxa(TopNOTUs, Banturegion_subset)
+p <- plot_bar(ent15, "Genus", fill = "Genus", facet_grid = Bantu_ANTS~Bantu_region)  
+
+p <- p + geom_bar(aes(color=Genus, fill=Genus), stat="identity", position="stack") + scale_y_continuous(trans="log10", limits=c(NA,200))
+
+
+p <- as.data.frame(as.matrix(p))
+p + ggplot(aes(color=Genus, fill=Genus), data = p) + 
+                  geom_bar(stat="identity", position="stack") +
+scale_x_continuous(trans="log10", limits=c(NA,1))
+
+scale_x_continuous(trans="log10", limits=c(NA,1))
+
+ggplot(ent15, aes(x=Bantu_region, fill="Genus")) +
+  geom_bar(stat="identity") +
+  scale_y_log10()
+
+###Lactose differences?
+#Bray-Curtis
+t_physeq1 <- physeq1 %>% transform_sample_counts((function (x) x/sum(x)))
+tax_table(t_physeq1) <- cbind(tax_table(t_physeq1), OTU = taxa_names(t_physeq1))
+plot_otus <- taxa_names(t_physeq1)
+ordu <- ordinate(t_physeq1, "PCoA", "bray")
+p <- plot_ordination(t_physeq1, ordu, type ="samples")
+taxdf <- plot_ordination(t_physeq1, ordu, type="taxa", justDF = TRUE)
+taxdf <- taxdf %>%
+    filter(OTU %in% plot_otus)
+p + 
+    geom_point(data = taxdf, color = "blue", shape = 3, size = 3)
+
+Lactose_subset <- subset_samples(physeq1, Lactose_Binary%in%c("LNP","LP"))
+dist_bray <- distance(Lactose_subset, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+ord_bray <- ordinate(Lactose_subset, method="PCoA", distance=dist_bray)
+
+Lactose_BC<-plot_ordination(Lactose_subset, ord_bray, color="Lactose_Binary")+ #shape="Subsistence") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("LNP" = "#ffcc99", "LP" = "#999FFF")) + theme_bw()
+
+adonis(distance(Lactose_subset, method="bray",) ~ Lactose_Binary, data = CM_US_metadata)
+
+t_physeq1<-transform_sample_counts(physeq1, function(x) x / sum(x))
+
+sub_beta_RA <- subset_taxa(t_physeq1, Genus =="g__Bifidobacterium" & !is.na(Genus))
+
+samp <- subset_samples(t_physeq1, !is.na(Lactose_Binary))
+
+sub_beta_order_RA <- tax_glom(sub_beta_RA, taxrank = "Order", NArm = TRUE)
+ggplotp <- plot_bar(sub_beta_RA, "Genus", fill = "Genus", facet_grid = ~Lactose_Binary) + theme_bw()
+
+ggplotp <- plot_bar(sub_beta_RA, "Genus", fill = "Genus", facet_grid=~Lactose_Binary, NArm = TRUE) + theme_bw()
+
+
+p <- ggplotp +  geom_bar(aes(color=Genus, fill=Genus, na.rm = TRUE), stat="identity", position="stack") 
+
+
+TopNOTUs = names(sort(taxa_sums(Lactose_subset), TRUE)[1:60])
+ent20 = prune_taxa(TopNOTUs, Lactose_subset)
+p <- plot_bar(ent20, "Genus", fill = "Genus", facet_grid = ~Lactose_Binary) + theme_bw()  
+p <- plot_bar(ent20, "Family", fill = "Family", facet_grid = ~Lactose_Binary)  
+
+p <- p + geom_bar(aes(color=Family, fill=Family), stat="identity", position="stack") + scale_y_continuous(trans="log10", limits=c(NA,200))
+
+p <- p + geom_bar(aes(color=Genus, fill=Genus), stat="identity", position="stack") + scale_y_continuous(trans = "log10")
+
+#Jaccard
+Lactose_subset <- subset_samples(physeq1, Lactose_Binary%in%c("LNP","LP"))
+
+dist_jac <-distance(Lactose_subset, method="jaccard", binary = TRUE) #- presence/absence
+
+ord_jac <- ordinate(Lactose_subset, method="PCoA", distance=dist_jac)
+
+Lactose_J<-plot_ordination(Lactose_subset, ord_jac, color="Lactose_Binary")+ #shape="Subsistence") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("LNP" = "#ffcc99", "LP" = "#999FFF")) + theme_bw()
+
+adonis(distance(Lactose_subset, method="jaccard",) ~ Lactose_Binary, data = CM_US_metadata)
+
+###Lactose differences in ONLY FULANI
+#Bray-Curtis
+t_physeq1 <- physeq1 %>% transform_sample_counts((function (x) x/sum(x)))
+tax_table(t_physeq1) <- cbind(tax_table(t_physeq1), OTU = taxa_names(t_physeq1))
+plot_otus <- taxa_names(t_physeq1)
+ordu <- ordinate(t_physeq1, "PCoA", "bray")
+p <- plot_ordination(t_physeq1, ordu, type ="samples")
+taxdf <- plot_ordination(t_physeq1, ordu, type="taxa", justDF = TRUE)
+taxdf <- taxdf %>%
+    filter(OTU %in% plot_otus)
+p + 
+    geom_point(data = taxdf, color = "blue", shape = 3, size = 3)
+
+Lactose_subset <- subset_samples(physeq1, Lactose_Binary%in%c("LNP","LP"))
+
+Fulani_Lactose_subset <- subset_samples(Lactose_subset, Subsistence%in%c("Pastoralist"))
+
+dist_bray <- distance(Fulani_Lactose_subset, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+ord_bray <- ordinate(Fulani_Lactose_subset, method="PCoA", distance=dist_bray)
+
+Fulani_Lactose_subset_BC<-plot_ordination(Fulani_Lactose_subset, ord_bray, color="Lactose_Binary")+ #shape="Subsistence") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("LNP" = "#ffcc99", "LP" = "#999FFF")) + theme_bw()
+
+test <- CM_US_metadata %>% group_by(Subsistence) %>% filter(Subsistence == "Pastoralist") %>% as.data.frame()
+
+adonis(distance(Fulani_Lactose_subset, method="bray",) ~ as.factor(Lactose_Binary), data = test)
+
+t_physeq1<-transform_sample_counts(physeq1, function(x) x / sum(x))
+
+sub_beta_RA <- subset_taxa(t_physeq1, Genus =="g__Bifidobacterium" & !is.na(Genus))
+
+samp <- subset_samples(t_physeq1, !is.na(Lactose_Binary))
+
+sub_beta_order_RA <- tax_glom(sub_beta_RA, taxrank = "Order", NArm = TRUE)
+ggplotp <- plot_bar(sub_beta_RA, "Genus", fill = "Genus", facet_grid = ~Lactose_Binary) + theme_bw()
+
+ggplotp <- plot_bar(sub_beta_RA, "Genus", fill = "Genus", facet_grid=~Lactose_Binary, NArm = TRUE) + theme_bw()
+
+
+p <- ggplotp +  geom_bar(aes(color=Genus, fill=Genus, na.rm = TRUE), stat="identity", position="stack") 
+
+
+TopNOTUs = names(sort(taxa_sums(Lactose_subset), TRUE)[1:60])
+ent20 = prune_taxa(TopNOTUs, Lactose_subset)
+p <- plot_bar(ent20, "Genus", fill = "Genus", facet_grid = ~Lactose_Binary) + theme_bw()  
+p <- plot_bar(ent20, "Family", fill = "Family", facet_grid = ~Lactose_Binary)  
+
+p <- p + geom_bar(aes(color=Family, fill=Family), stat="identity", position="stack") + scale_y_continuous(trans="log10", limits=c(NA,200))
+
+p <- p + geom_bar(aes(color=Genus, fill=Genus), stat="identity", position="stack") + scale_y_continuous(trans = "log10")
+
+
+
+#dissimilarity matrices
+#Bray-Curtis is used to quantify the compositional dissimilarity between two different sites, based on counts at each site. I like it because it is simple and doesn't make assumptions about genetic relationships. 
+#The Bray-Curtis index and the Sorensen index take values from zero to one. In a similarity index, a value of 1 means that the two communities you are comparing share all their species, while a value of 0 means they share none. In a dissimilarity index the interpretation is the opposite: 1 means that the communities are totally different. 
+#Distance and dissimilarity are sometimes used interchangeably. However, the Wikipedia page of the Bray-Curtis dissimilarity (https://en.wikipedia.org/wiki/Bray%E2%80%93Curtis_dissimilarity) says that it is incorrect to call it a distance, since it doesn't satisfy the triangle inequality (the sum of the lengths of two sides of a triangle is always greater than the length of the third side). That is, the sum of the dissimilarities between communities A and B and communities A and C is not necessarily greater than between communities B and C.
+#For more information, you can check:
+#http://www.econ.upf.edu/~michael/stanford/maeb5.pdf
+#http://www.planta.cn/forum/files_planta/chapter_8_analysis_of_differences_in_species_composition_172.pdf
+#Jaccard prioritizes cooccurrence of species as opposed to distances based on a correlation coefficient that put presence and absence on similar standing.
+
+dist_bray <- distance(physeq1, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+dist_js <- distance(physeq1, method="jsd") #Jensen-Shannon Divergence- abundance
+dist_rjs <- sqrt(dist_js) #Jensen-Shannon Distance
+dist_jac <-distance(physeq1, method="jaccard", binary = TRUE) #- presence/absence
+ord_bray <- ordinate(physeq1, method="PCoA", distance=dist_bray)
+ord_JS  <- ordinate(physeq1, method="PCoA", distance=dist_js)
+ord_RJS <- ordinate(physeq1, method="PCoA", distance=dist_rjs)
+ord_jac <- ordinate(physeq1, method="PCoA", distance=dist_jac)
+
+#Population ordination
+Pop_RJS<- plot_ordination(physeq1, ord_RJS, color="Population") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+CM_US_metadata$Population[362] <- c('Mbororo_Fulani')
+adonis(distance(physeq1, method="jsd",)~Population, data=CM_US_metadata)
+
+Pop_BC<-plot_ordination(physeq1, ord_jac, color="Population") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+Pop_BC + 
+  stat_ellipse(type = "t")+
+  theme_bw()
+
+Pop_jac<-plot_ordination(physeq1, ord_jac, color="Population") + 
+ggplot2::ggtitle("Jaccard Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+adonis(distance(physeq1, method="jaccard",)~Population, data=CM_US_metadata)
+
+#Country Bray-Curtis Plots with Confidence Ellipses and Stats tests
+Country_BC <-plot_ordination(physeq1, ord_jac, color="Country") + ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Cameroon" = "#ffcc99", "USA" = "#001d73")) + #geom_text(label = CM_US_metadata$sampleID)
+
+geom_text(label = ifelse(CM_US_metadata$sampleID == "^D", as.character(CM_US_metadata$sampleID),""))
+
+(str_detect(Registration[i], "(?i)^Registration Required"))
+
+Country_BC + 
+  stat_ellipse(type = "t")+
+  theme_bw()
+
+D_BC <- list("D0478", "D0428","D0475","D0560","D0280","D0124","D0401","D0562","D0784","D0792","D0632","D0134","D0292","D1242","D582","D210","D1252","D0492","D0783","D0490","D0482","D0800") 
+
+D_JAC <- list("D0307","D0645","D0624","D1232","D0490","D1262","D0718","D0492","216","D1251","D1244","D1255","D0587","D0621","D0604","D0470","D0211","D0497","D0509","D0500","D0259","D1276","D0223","D0947","D1252","D1242","D0477","D0605","D0474","D1289","D1265","D1237","D1288","D1223","D0431","D0783","D0742","D0202","D0309","D0210","D0482","D1238","D0385","D0225","D0472","D0234","D0632","D0792","D0433","D0784","D1266","D560")
+#What are subsistence groups for each list?
+#What is overlap between each group? 
+#jaccard_45 <- distance(dist_bray, "jaccard")
+
+df_45 <- as(sample_data(physeq1), "data.frame")
+
+groups <- df_45[["Country"]]
+groups
+mod <- betadisper(dist_bray, groups)
+
+anova(mod)
+
+the dispersion is different between groups, then examine
+plot(mod)
+boxplot(mod)
+mod.HSD <- TukeyHSD(mod)
+plot(mod.HSD)
+
+adonis(distance(physeq1, method="bray",)~Population, data=CM_US_metadata_t)
+
+
+#Age 
+Age_RJS<- plot_ordination(physeq1, ord_RJS, color="Age") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") + theme_bw()
+
+adonis(distance(physeq1, method="jsd",)~Age, data=CM_US_metadata)
+
+Age_BC<-plot_ordination(physeq1, ord_bray, color="Age") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +   theme_bw()
+
+adonis(distance(physeq1, method="bray",)~Age, data=CM_US_metadata)
+
+Age_jac<-plot_ordination(physeq1, ord_jac, color="Age") + 
+ggplot2::ggtitle("Jaccard Distance Principal Coordinates Analysis") + theme_bw()  
+
+adonis(distance(physeq1, method="jaccard",)~Age, data=CM_US_metadata)
+
+#Sex
+Sex_RJS<- plot_ordination(physeq1, ord_RJS, color="Sex") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c")) + theme_bw()
+
+
+adonis(distance(physeq1, method="jsd",)~Sex, data=CM_US_metadata)
+
+Sex_BC<-plot_ordination(physeq1, ord_bray, color="Sex") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c")) + theme_bw()
+
+adonis(distance(physeq1, method="bray",)~Sex, data=CM_US_metadata)
+
+Sex_jac<-plot_ordination(physeq1, ord_jac, color="Sex") + 
+ggplot2::ggtitle("Jaccard Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c")) + theme_bw()
+
+
+adonis(distance(physeq1, method="jaccard",)~Sex, data=CM_US_metadata)
+
+#SamplingSite
+
+Site_RJS<- plot_ordination(physeq1, ord_RJS, color="Sampling.Site") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") +   scale_color_manual(values=c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "USA" = "#001d73", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098")) + theme_bw()
+
+
+adonis(distance(physeq1, method="jsd",)~Sampling.Site, data=CM_US_metadata)
+
+Site_BC<-plot_ordination(physeq1, ord_bray, color="Sampling.Site") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "USA" = "#001d73", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098")) + theme_bw()
+
+
+adonis(distance(physeq1, method="bray",)~Sampling.Site, data=CM_US_metadata)
+
+Site_jac<-plot_ordination(physeq1, ord_jac, color="Sampling.Site") + 
+ scale_color_manual(values=c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "USA" = "#001d73", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098"))  + theme_bw()
+
+
+adonis(distance(physeq1, method="jaccard",)~Sampling.Site, data=CM_US_metadata)
+
+plot_ordination(physeq1, ord_bray, color="Total_ANTS") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +     scale_color_manual(values=c('0' = '#3500BF', '1' = '#00A8BF', '2' = '#07BF00', '3' = '#BF9A00', '4' = '#BF0042')) + theme_bw()
+                            
+ANTS_physeq<- plot_ordination(physeq1, ord_bray, color="Total_ANTS") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +     
+scale_color_manual(values = c("#CFC86A", "#A4976E", "#7A6672", "#4F3576", "#25047B"), na.value="#FAF966") + theme_bw()
+
+#Plot bray curtis distances on ants binary
+
+ANTS_binary_physeq<- plot_ordination(physeq1, ord_bray, color="ants_binary") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS status") +     
+scale_color_manual(values = c("#ffcc99", "#999FFF"), na.value="#ffffff") + theme_bw()
+
+
+Total <- colSums(otu_table(physeq1), na.rm = TRUE)
+
+adonis(distance(physeq1, method="bray",)~ants_binary, data=CM_US_metadata)
+
+
+BC.dist=vegdist(counts3, distance="bray")
+#Run PERMANOVA on distances.
+adonis(BC.dist ~ AgeGroup*ADGKG, data = meta, permutations = 1000)
+##Ordinate on Prevotellaceae abundance###
+
+idxl_prevo <- as.data.frame(tax_table(physeq1))$Family == "f__Prevotellaceae"
+
+Prev <- colSums(otu_table(physeq1)[idxl_prevo,], na.rm = TRUE)
+Total <- colSums(otu_table(physeq1), na.rm = TRUE)
+Prev <- Prev/Total
+
+#Prev <- as.numeric(otu_table(physeq1)["f_Prevotellaceae",])
+sampledata2$Prevotellaceae <- Prev
+sample_data(physeq1) <- sampledata2
+Prev_RJS <- plot_ordination(physeq1, ord_bray, color="Prevotellaceae") + scale_color_gradient(low = "#CFC86A", high = "#25047B") + ggtitle("Prevotellaceae Abundance") + theme_bw()
+
+##Ordinate on Bacteroidaceae abundance###
+
+idxl_bact <- as.data.frame(tax_table(physeq1))$Family == "f__Bacteroidaceae"
+
+
+Bact <- colSums(otu_table(physeq1)[idxl_bact,], na.rm = TRUE)
+Total <- colSums(otu_table(physeq1), na.rm = TRUE)
+Bact <- Bact/Total
+
+#Prev <- as.numeric(otu_table(physeq1)["f_Prevotellaceae",])
+sampledata2$Bacteroidaceae <- Bact
+sample_data(physeq1) <- sampledata2
+Bact_RJS <- plot_ordination(physeq1, ord_bray, color="Bacteroidaceae") + scale_color_gradient(low = "#CFC86A", high = "#25047B") + ggtitle("Bacteroidaceae Abundance") + theme_bw()
+
+"#3E12F3", high = "#d60A13"
+
+##Ordinate on Ruminococcaceae abundance###
+
+idxl_bact <- as.data.frame(tax_table(physeq1))$Family == "f__Ruminococcaceae"
+
+
+Bact <- colSums(otu_table(physeq1)[idxl_bact,], na.rm = TRUE)
+Total <- colSums(otu_table(physeq1), na.rm = TRUE)
+Bact <- Bact/Total
+
+#Prev <- as.numeric(otu_table(physeq1)["Ruminococcaceae",])
+sampledata2$Ruminococcaceae <- Bact
+sample_data(physeq1) <- sampledata2
+Rumino_Bray <-plot_ordination(physeq1, ord_bray, color="Ruminococcaceae") + ggtitle("Ruminococcaceae Abundance")+ scale_color_gradient(low = "#3E12F3", high = "#d60A13") + theme_bw()
+###5.1 1. Prediction Strength
+### LEGACY Source code from github for prediction strength allowing distance matrices
+# suppressPackageStartupMessages(library(RCurl))
+# string = getURL("https://raw.githubusercontent.com/danknights/mice8992-2016/master/src/prediction.strength.r")
+# eval(parse(text=string))
+```
+####
+###Bacteroides to Prevotella Ratio###
+###==================================
+```{r}
+idx1_bact <- as.data.frame(tax_table(physeq1))$Genus == "g__Bacteroides"
+idx2_bact <- as.data.frame(tax_table(physeq1))$Genus == "g__Prevotella"
+#bact_ratio <- idxl_bact,/[idx2_bact,]
+
+Bact1 <- colSums(otu_table(physeq1)[idx1_bact,], na.rm = TRUE)
+Total1 <- colSums(otu_table(physeq1), na.rm = TRUE)
+Bact1 <- Bact1/Total1
+
+Bact2 <- colSums(otu_table(physeq1)[idx2_bact,], na.rm = TRUE)
+Total2 <- colSums(otu_table(physeq1), na.rm = TRUE)
+Bact2 <- Bact2/Total2
+
+ratio <- (Bact1-Bact2)/(Bact1+Bact2)
+ratio2 <- Bact2/Bact1
+#Prev <- as.numeric(otu_table(physeq1)["Ruminococcaceae",])
+sampledata2$ratio <- ratio
+sample_data(physeq1) <- sampledata2
+Bacteroides_Bray <-plot_ordination(physeq1, ord_bray, color="ratio") + ggtitle("Bacteroides to Prevotella Abundance Ratio")+ scale_color_gradient(low = "#3E12F3", high = "#d60A13") + theme_bw()
+#3E12F3", high = "#d60A13"
+
+```
+
+###Plot Cluster Validation methods
+###=====================
+
+```{r}
+library(fpc)
+
+ps_bray <- prediction.strength(dist_bray, Gmin = 2, Gmax = 10, clustermethod = pamkCBI)
+ps_js <- prediction.strength(dist_js, Gmin = 2, Gmax = 10, clustermethod = pamkCBI)
+ps_rjs <- prediction.strength(dist_rjs,Gmin = 2, Gmax = 10, clustermethod = pamkCBI)
+
+plot_cluster_validation = function(bray,js,rjs, legend=T,...) {
+  plot(2:10, bray, type="b", pch=1, xlab="Number of Clusters", ...)
+  lines(2:10, js, type="b", pch=2, lty=2)
+  lines(2:10, rjs, type="b", pch=22, lty=3)
+  if(legend) legend("topright", legend = c("Bray-Curtis","Jensen-Shannon", "Root Jensen-Shannon"), pch=c(1,2,22), lty=1:3)
+}
+plot_cluster_validation(ps_bray$mean.pred[2:10], ps_js$mean.pred[2:10], ps_rjs$mean.pred[2:10], ylab="Prediction Strength",ylim=c(0,1.1),legend=F)
+abline(.9,0, lty=5, col="grey70")
+abline(0.8,0,lty=8, col="grey70")
+text("Strong support", x=9,y=1, col="grey70")
+text("Moderate support", x=9, y=.85, col="grey70")
+text("Little or no support", x=9, y=.6, col="grey70")
+
+###Make clusters in PCoA based on clusters predicted by cluster validation model 
+library(cluster)
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+samp <- data.frame(sample_data(physeq1))
+#calculate a covariate for HMP vs community
+#samp$source = factor(samp$study == "HMP_2012", levels=c(T,F), labels=c("HMP","Community"))
+#update sample data with HMP covariate
+sample_data(physeq1) <- samp
+samp$bray_cluster_2 <- factor(pam(dist_bray, k=2, cluster.only = T))
+samp$bray_cluster_3 <- factor(pam(dist_bray, k=3, cluster.only = T))
+samp$bray_cluster_4 <- factor(pam(dist_bray, k=4, cluster.only = T))
+samp$RJS_cluster_2 <- factor(pam(dist_rjs, k=2, cluster.only = T))
+samp$RJS_cluster_3 <- factor(pam(dist_rjs, k=3, cluster.only = T))
+samp$JS_cluster_2 <- factor(pam(dist_js, k=2, cluster.only = T))
+
+
+sample_data(physeq1) <- samp
+plot_ordination(physeq1, ord_bray, color="bray_cluster_3") + 
+  ggplot2::ggtitle("Bray-Curtis Divergence PCoA with 3 Clusters") + theme_bw()
+
+plot_ordination(physeq1, ord_bray, color="RJS_cluster_3") + 
+  ggplot2::ggtitle("Jensen-Shannon Distance PCoA with 3 Clusters") + theme_bw()
+```
+###t-SNE plots###
+###====================
+```{r}
+library(phyloseq)
+##The dissimilarity measure to use. Either one of bray (default) unifrac, wunifrac, jsd, dpcoa or philr.
+
+###ETHNICITY###
+tsne_res_CM)_bray <- tsne_phyloseq(physeq1, distance='bray',
+   perplexity = 8, verbose=0, rng_seed = 3901)
+plot_tsne_phyloseq(physeq1, tsne_res_CM,
+color = 'Ethnicity' , title='t-SNE (Bray-Curtis Divergence)') +
+scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+tsne_res_CM_jsd <- tsne_phyloseq(physeq1, distance='jsd',
+   perplexity = 8, verbose=0, rng_seed = 3901)
+plot_tsne_phyloseq(physeq1, tsne_res_CM,
+color = 'Ethnicity' , title='t-SNE (Jensen-Shannon Distance)') +
+scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+#phylotreenotavailable
+tsne_res_CM_wuf <- tsne_phyloseq(physeq1, distance='wunifrac',
+   perplexity = 8, verbose=0, rng_seed = 3901)
+plot_tsne_phyloseq(physeq1, tsne_res_CM,
+color = 'Ethnicity' , title='t-SNE (Weighted UniFrac)') +
+scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+tsne_res_CM_uf <- tsne_phyloseq(physeq1, distance='unifrac',
+   perplexity = 8, verbose=0, rng_seed = 3901)
+plot_tsne_phyloseq(physeq1, tsne_res_CM,
+color = 'Ethnicity' , title='t-SNE (Unweighted UniFrac)') +
+scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+
+
+###Color by gradients for things that have counts###
+tsne_res_CM <- tsne_phyloseq(physeq1, distance='bray',
+   perplexity = 8, verbose=0, rng_seed = 3901)
+plot_tsne_phyloseq(physeq1, tsne_res_CM,
+color = 'Ethnicity' , title='t-SNE (Bray-Curtis Divergence)') 
++
+scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5")) + theme_bw()
+
+library(phyloseq)
+
+############################
+###AFRICANS ONLY ANALYSIS###
+############################
+
+counts4 <- as.data.frame(counts4)
+CM_only <- CM_US_metadata[-1:-37,] #makes df of CM only, no US
+
+counts5<- select(counts4, -starts_with('3'))
+#counts5 <-subset(counts5, select = -c(D0911, D0523, D0056))
+
+
+counts6 <- as.matrix(counts5)
+
+#check that rownames are the same between taxonomic table and otu counts
+
+#Jesse- you can just modify indx_cts3 to be rowSums(counts3)>0 so it's a working index vector on the full-length variables (instead of rowSums(counts4) which'll be working with a shortened form already).  You need a vector that has one logical value for every position in the original ta/counts, so it'll need to be 14138 long, with 13808 TRUE and the rest FALSE.  Then after doing ta[indx_cts3, ] you'll only have 13808 rows in ta3. Does that make sense?
+#hmm or you can base index_cts4 on counts6 instead of 7, and then use ta3 instead of ta (if I'm tracking the variables corectly)since nrow(ta3) == nrow(counts6) and it looks like their rows should match up
+
+counts7 <- counts6[rowSums(counts6)>0,]
+index_cts4 <- rowSums(counts6)>0
+str(index_cts4)
+ta4 <- ta3[index_cts4,] #this isn't working
+
+#test <- dplyr::filter(ta4,`Feature ID` %in% rownames(counts7))
+
+      
+if(!all((ta4$`Feature ID`)==((rownames(counts7))))) stop("Row names don't match")
+
+
+#Only include ASVs in ta that match ASVs in counts 
+
+ta4 <- as.data.frame(ta4)
+ta4 <- split_assignments(ta4$trunc_taxon)
+rownames(ta4) <-rownames(counts7)
+
+rownames(counts7) %in% rownames(ta4)
+
+ta4 <- as.matrix(ta4)
+counts7 <- as.matrix(counts7)
+
+OTU = otu_table(counts7, taxa_are_rows = TRUE)
+TAX = tax_table(ta4)
+physeq = phyloseq(OTU, TAX)
+physeq
+
+shotgun_CM_US_metadata  <-read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/shotgun_metadata_cameroon_4219.csv", sep=",", header=TRUE)
+
+shotgunslice <- dplyr::select(shotgun_CM_US_metadata, sampleID, ants_binary)
+shotgunslice <- shotgunslice %>% filter(str_detect(sampleID, "^D"))
+
+drops <- c("D0027", "D0056","D0071","D0081","D0410","D0523","D0785","D0890","D0911","D0970","D1193","D1218","D1224", "D1250","D1296","D0911","D0523","D0056")
+shotgunslice <- shotgunslice %>% filter(!(sampleID %in% drops))
+colnames(shotgunslice)[1] <- c("SampleID")
+
+CM_antsbinary <- right_join(CM_US_metadata, shotgunslice, by = "SampleID")
+rownames(CM_antsbinary) <- CM_antsbinary[,1]
+CM_antsbinary <- CM_antsbinary[,-1]
+CM_antsbinary$ants_binary <- CM_antsbinary$ants_binary.x
+
+CM_antsbinary$ants_binary.x <- NULL
+
+
+#CM_antsbinary <- t(CM_antsbinary)
+
+sampledata3 = sample_data(data.frame(CM_antsbinary,
+  rownames = sample_names(physeq),
+  stringsAsFactors=FALSE
+))
+
+#sampledata
+physeq_CM = merge_phyloseq(physeq, sampledata3)
+
+#sampledata2$ratio <- ratio
+#sample_data(physeq1) <- sampledata3
+
+#################################################
+###BRAY CURTIS/JACCARD/PERMANOVA CAMEROON ONLY###
+#################################################
+
+dist_bray <- distance(physeq_CM, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+dist_js <- distance(physeq_CM, method="jsd") #Jensen-Shannon Divergence- abundance
+dist_rjs <- sqrt(dist_js) #Jensen-Shannon Distance
+dist_jac <-distance(physeq_CM, method="jaccard", binary = TRUE) #- presence/absence
+ord_bray <- ordinate(physeq_CM, method="PCoA", distance=dist_bray)
+ord_JS  <- ordinate(physeq_CM, method="PCoA", distance=dist_js)
+ord_RJS <- ordinate(physeq_CM, method="PCoA", distance=dist_rjs)
+ord_jac <- ordinate(physeq_CM, method="PCoA", distance=dist_jac)
+
+#Population ordination
+Pop_RJS<- plot_ordination(physeq_CM, ord_RJS, color="Population") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", Baka" = "#f58aa5")) + theme_bw()
+
+adonis(distance(physeq_CM, method="jsd",)~Population, data=CM_111118)
+
+Pop_BC<-plot_ordination(physeq_CM, ord_bray, color="Population") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "Baka" = "#f58aa5")) + theme_bw()
+
+adonis(distance(physeq_CM, method="bray",)~Population, data=CM_111118)
+
+Pop_jac<-plot_ordination(physeq_CM, ord_jac, color="Population") + 
+ggplot2::ggtitle("Jaccard Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "Baka" = "#f58aa5")) + theme_bw()
+
+adonis(distance(physeq_CM, method="jaccard",)~Population, data=CM_111118)
+
+
+#Age 
+Age_RJS<- plot_ordination(physeq_CM, ord_RJS, color="Age") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") + theme_bw()
+
+adonis(distance(physeq_CM, method="jsd",)~Age, data=CM_111118)
+
+Age_BC<-plot_ordination(physeq_CM, ord_bray, color="Age") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +   theme_bw()
+
+adonis(distance(physeq_CM, method="bray",)~Age, data=CM_111118)
+
+Age_jac<-plot_ordination(physeq_CM, ord_jac, color="Age") + 
+ggplot2::ggtitle("Jaccard Distance Principal Coordinates Analysis") + theme_bw()  
+
+adonis(distance(physeq_CM, method="jaccard",)~Age, data=CM_111118)
+
+#Sex
+Sex_RJS<- plot_ordination(physeq_CM, ord_RJS, color="Sex") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c")) + theme_bw()
+
+
+adonis(distance(physeq_CM, method="jsd",)~Sex, data=CM_111118)
+
+Sex_BC<-plot_ordination(physeq_CM, ord_bray, color="Sex") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +    scale_color_manual(values=c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c")) + theme_bw()
+
+adonis(distance(physeq_CM, method="bray",)~Sex, data=CM_111118)
+
+Sex_jac<-plot_ordination(physeq_CM, ord_jac, color="Sex") + 
+ggplot2::ggtitle("Jaccard Distance Principal Coordinates Analysis") +    scale_color_manual(values=c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c")) + theme_bw()
+
+
+adonis(distance(physeq_CM, method="jaccard",)~Sex, data=CM_111118)
+
+#SamplingSite
+
+Site_RJS<- plot_ordination(physeq_CM, ord_RJS, color="Sampling.Site") + 
+ggplot2::ggtitle("Jensen-Shannon Distance Principal Coordinates Analysis") +   scale_color_manual(values=c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098")) + theme_bw()
+
+
+adonis(distance(physeq_CM, method="jsd",)~Sampling.Site, data=CM_111118)
+
+Site_BC<-plot_ordination(physeq_CM, ord_bray, color="Sampling.Site", shape = "Sampling.Site") + 
+ggplot2::ggtitle("Bray-Curtis Divergence Principal Coordinates Analysis") +
+scale_shape_manual(values=c("Aviation" = 19, "Bidou_I" = 19, "Bosquet" = 19, "Missoume" = 19, "Ndtoua" =19, "Njibot" = 19,"Nkolbikong"=19,"Ntambang"=15,"Sabga"=15)) +
+scale_color_manual(values=c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098")) +
+theme_bw()
+
+
+
+adonis(distance(physeq_CM, method="bray",)~Sampling.Site, data=CM_111118)
+
+Site_jac<-plot_ordination(physeq_CM, ord_jac, color="Sampling.Site") + 
+ scale_color_manual(values=c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098"))  + theme_bw()
+
+
+adonis(distance(physeq_CM, method="jaccard",)~Sampling.Site, data=CM_111118)
+
+plot_ordination(physeq_CM, ord_bray, color="Total_ANTS") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +     scale_color_manual(values=c('0' = '#3500BF', '1' = '#00A8BF', '2' = '#07BF00', '3' = '#BF9A00', '4' = '#BF0042')) + theme_bw()
+
+#ANTS only 
+ANTS_physeq<- plot_ordination(physeq_CM, ord_bray, color="Total_ANTS") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +
+scale_color_viridis(option = "inferno", end = .8, direction = -1) + theme_bw()
+
+#ANTS and sampling site
+ANTS_physeq<- plot_ordination(physeq_CM, ord_bray, color="Total_ANTS", shape = "Sampling.Site") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +
+scale_shape_manual(values=c("Aviation" = 19, "Bidou_I" = 19, "Bosquet" = 19, "Missoume" = 19, "Ndtoua" =19, "Njibot" = 19,"Nkolbikong"=19,"Ntambang"=8,"Sabga"=8)) +
+scale_color_viridis(option = "inferno", end = .8, direction = -1) + theme_bw()
+
+#Plot bray curtis distances on ants binary
+#Only Cameroon subset
+physeq_CM <- subset_samples(physeq1, Population != c("USA"))
+
+ANTS_binary_physeq<- plot_ordination(physeq_CM, ord_bray, color="Population", shape = "ants_binary") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS status")  +
+scale_color_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "Baka" = "#f58aa5")) + 
+scale_shape_manual(values=c("Positive" = 17, "Negative"= 2)) +
+scale_fill_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "Baka" = "#f58aa5")) +
+geom_point(size=3) +
+theme_bw()
+
+ANTS_binary_physeq$layers <- ANTS_binary_physeq$layers[-1]
+
+#Use shape to indicate pos and neg- circles are neg 19, triangles are pos17; fill is bacteroides --> Prev
+Bacteroides_Bray <-plot_ordination(physeq1, ord_bray, color="ratio") + ggtitle("Bacteroides to Prevotella Abundance Ratio")+ scale_color_gradient(low = "#3E12F3", high = "#d60A13") + theme_bw()
+
+ANTS_binary_physeq<- plot_ordination(physeq_CM, ord_bray, color="ratio", shape = "ants_binary") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS status")  +
+scale_color_gradient(low = "#3E12F3", high = "#d60A13") + 
+scale_shape_manual(values=c("Positive" = 17, "Negative"= 19)) +
+#scale_fill_manual(values=c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "Baka" = "#f58aa5")) +
+geom_point(size=3) +
+theme_bw()
+
+ANTS_binary_physeq$layers <- ANTS_binary_physeq$layers[-1]
+
+adonis(distance(physeq_CM, method="bray",)~ants_binary, data= CM_antsbinary)
+
+############
+###pHeatmaps
+############
+
+a <- simplify_assignments(adf, rank1="Phylum", rank2="Genus")
+names(a) <- ta$`Feature ID`
+summed_cts <- rowsum(counts, a) 
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props_pheat <-subset(summed_props, select = -c(D0911, D0523, D0056))
+
+summed_props_pheat_nocntrl <- subset(summed_props_pheat, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+subpropnocntrl_subset <- as.matrix(summed_props_pheat_nocntrl[rowSums(summed_props_pheat_nocntrl)>2,])
+
+#subpropnocntrl_subset[subpropnocntrl_subset==0] <- NA
+library(readr)
+shotgun_metadata_cameroon_21319 <- read_csv("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/shotgun_metadata_cameroon_4219.csv")
+View(shotgun_metadata_cameroon_21319)
+shotgun_metadata_cameroon_21319$X1 <- NULL
+
+CM_US_metadata_subset <- select(shotgun_metadata_cameroon_21319, sampleID, Population, Subsistence, Sampling.Site, Sex)
+
+#Deselect 
+rownames(CM_US_metadata_subset) <- CM_US_metadata_subset$sampleID
+
+View(CM_US_metadata_subset)
+CM_US_metadata_subset$Population[373] <- 'Mbororo_Fulani'
+CM_US_metadata_subset$Subsistence[373] <- 'Pastoralist'
+CM_US_metadata_subset$Subsistence[1:37] <- 'Industrial_Agropastoralist'
+CM_US_metadata_subset$Population[1:37] <- 'USA'
+CM_US_metadata_subset$Sampling.Site[1:37] <- 'USA'
+CM_US_metadata_subset$sampleID <- NULL
+CM_US_metadata_subset$Age <- NULL
+
+CM_US_metadata_subset <- as.data.frame(t(CM_US_metadata_subset))
+dim(CM_US_metadata_subset)
+
+CM_US_metadata_subset <- as.data.frame(CM_US_metadata_subset)
+
+CM_US_metadata_subset <- subset(CM_US_metadata_subset, select = -c( `cytokine_high20-557`, `cytokine_high564-1293`, `cytokine_low20_557`, `cytokine_low564_1293`, `LibNeg1`, `LibNeg2`,`EB110`, `EB73`, `EB1`, `EB105`, `EB19`, `EB56`, `EB55`, `PCR1`, `PCR2`, `PCR3`, `PCR4`, `V4GBlock1`, `V4GBlock2`, `V4GBlock3`, `V4GBlock4`) )
+
+
+
+#summed_props_pheat_nocntrl <- subset(summed_props_pheat, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+
+ann_colors = list(
+    Population = c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5"),
+    
+    Sampling.Site = c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098", "USA" = "#001d73"),
+    Subsistence =c("Agropastoralist" = "#ffcc99", "Pastoralist" = "#999FFF", "Hunter-Gatherer" = "#993366", "Industrial_Agropastoralist" = "#001d73"),
+    Sex = c("F" = "#ffcc99", "M" = "#999FFF", "UNKNOWN" = "#a9315c"))
+    
+CM_US_metadata_subset <- as.data.frame(t(CM_US_metadata_subset))
+
+heatmap_CMUS_temp <- pheatmap(subpropnocntrl_subset, color= colorRampPalette(brewer.pal(n=7, name = "Reds"))(100), annotation_col = CM_US_metadata_subset, annotation_colors = ann_colors, clustering_method = "ward.D2", filename= "heatmap.pdf", width = 15, height = 10)
+
+#function to scale rows based on z scores (transform data to have mean of 0 and stand dev of 1), which centers and noramlizes the data. User can interpret color as x standard deviations from the mean and have an intuitive idea of the relative variation of that value.
+cal_z_score <- function(x){
+    (x - mean(x))/sd(x)
+}
+
+data_subset_norm <- t(apply(subpropnocntrl_subset, 1, cal_z_score))
+pheatmap(data_subset_norm)
+
+################################################
+###Heatmaps with Extraction and Library Controls
+################################################
+
+a <- simplify_assignments(adf, rank1="Phylum", rank2="Genus")
+names(a) <- ta$`Feature ID`
+summed_cts <- rowsum(counts, a) 
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props_pheat <-subset(summed_props, select = -c(D0911, D0523, D0056))
+
+subprop_subset <- as.matrix(summed_props_pheat[rowSums(summed_props_pheat)>2,])
+
+#subpropnocntrl_subset[subpropnocntrl_subset==0] <- NA
+library(readxl)
+FULL_CM_metadata_9618 <- read_excel("FULL_CM_metadata_9618.xlsx")
+View(FULL_CM_metadata_9618)
+CM_US_metadata <- as.data.frame(FULL_CM_metadata_9618)
+rownames(CM_US_metadata) = paste(CM_US_metadata$sampleID)
+CM_US_metadata<- subset(CM_US_metadata, select = -c(1))
+CM_US_metadata_t <- t(CM_US_metadata)
+CM_US_metadata_t <- as.data.frame(CM_US_metadata_t)
+CM_US_metadata_t <-subset(CM_US_metadata_t, select = -c(`cytokine_high20-557`, `cytokine_high564-1293`, `cytokine_low20_557`, `cytokine_low564_1293`,D0027,D0056, D0071,D0081,D0410,D0523,D0785,D0890,D0911,D0970,D1193,D1218,D1224, D1250,D1296,D0911,D0523,D0056))
+CM_US_metadata_t <- t(CM_US_metadata_t)
+CM_US_metadata_t <- as.data.frame(CM_US_metadata_t)
+
+
+CM_US_metadata_subset <- select(CM_US_metadata_t, Population, Sampling.Site, Total_Parasites_BloodParasites, HIV_positive_combokitresult)
+
+#rownames(CM_US_metadata_subset) = paste(CM_US_metadata$SampleID)
+CM_US_metadata_subset<- as.data.frame(CM_US_metadata_subset)
+CM_US_metadata_subset$Population[362] <- "Mbororo_Fulani"
+levels(CM_US_metadata_subset$Population) <- c(levels(CM_US_metadata_subset),"USA", "Baka","Bagyeli","Bantu","Mbororo_Fulani","Negative_Control","Positive_Control")
+CM_US_metadata_subset$Population[1:37] <- 'USA'
+CM_US_metadata_subset$Population[624:627] <- 'Positive_Control'
+CM_US_metadata_subset$Sampling.Site<-droplevels(CM_US_metadata_subset$Sampling.Site, exclude = "African_American")
+CM_US_metadata_subset$Sampling.Site<-droplevels(CM_US_metadata_subset$Sampling.Site, exclude = "European")
+CM_US_metadata_subset$Sampling.Site<-droplevels(CM_US_metadata_subset$Sampling.Site, exclude = "NA")
+levels(CM_US_metadata_subset$Sampling.Site) <- c(levels(CM_US_metadata_subset), "USA","Aviation","Bidou_I","Bosquet","Missoume","Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga")
+CM_US_metadata_subset$Sampling.Site[1:37] <- 'USA'
+CM_US_metadata_subset$Total_Parasites_BloodParasites <- as.integer(CM_US_metadata_subset$Total_Parasites_BloodParasites)
+CM_US_metadata_subset$Total_Parasites_BloodParasites[613:627] <- NA
+
+#rownames(CM_US_metadata_t)
+ann_colors = list(
+    Population = c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5", "Negative_Control" = "#808080", "Positive_Control" ="#000000"),
+    
+    Sampling.Site = c("Aviation" = "#7d6d00", "Bidou_I" = "#1f47c9", "Bosquet" = "#abd464", "Missoume" = "#c00097", "Ndtoua" ="#006d13", "Njibot" = "#b087ff", "Nkolbikong"="#ff545b","Ntambang"="#00b7e8","Sabga"="#624098", "USA" = "#001d73"))
+
+heatmap_CMUS_temp <- pheatmap(subprop_subset, color= colorRampPalette(brewer.pal(n=7, name = "Reds"))(100), annotation_col = CM_US_metadata_subset, annotation_colors = ann_colors)
+
+
+#function to scale rows based on z scores (transform data to have mean of 0 and stand dev of 1), which centers and noramlizes the data. User can interpret color as x standard deviations from the mean and have an intuitive idea of the relative variation of that value.
+cal_z_score <- function(x){
+    (x - mean(x))/sd(x)
+}
+
+data_subset_norm <- t(apply(subpropnocntrl_subset, 1, cal_z_score))
+pheatmap(data_subset_norm)
+
+#####################################
+###Heatmaps with qPCR parasite values
+#####################################
+#If pos in CM_US_metadata$PosOrNeg_Entamoeba, copy CM_US_metadata$AvgCqVal_Entamoeba to new column. 
+ann_colors = list(
+    Population = c("Bantu" = "#ffcc99", "Mbororo_Fulani" = "#999FFF", "Bagyeli" = "#a9315c", "USA" = "#001d73", "Baka" = "#f58aa5"))
+  
+
+library(readr)
+shotgun_metadata_cameroon_21319 <- read_csv("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/shotgun_metadata_cameroon_4219.csv")
+View(shotgun_metadata_cameroon_21319)
+shotgun_metadata_cameroon_21319$X1 <- NULL
+
+CM_US_metadata_subset <- select(shotgun_metadata_cameroon_21319, sampleID, Population)
+
+CM_US_metadata_subset$AvgCqVal_Entamoeba <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Entamoeba == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Entamoeba, NA)
+CM_US_metadata_subset$AvgCqVal_Ascaris <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Ascaris == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Ascaris, NA)
+CM_US_metadata_subset$AvgCqVal_Ancylostoma <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Ancylostoma == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Ancylostoma, NA)
+
+CM_US_metadata_subset$AvgCqVal_Giardia <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Giardia == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Giardia, NA)
+
+CM_US_metadata_subset$AvgCqVal_Necator <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Necator == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Necator, NA)
+
+CM_US_metadata_subset$AvgCqVal_PanCrypto <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_PanCrypto == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_PanCrypto, NA)
+
+CM_US_metadata_subset$AvgCqVal_Strongyloides <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Strongyloides == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Strongyloides, NA)
+
+CM_US_metadata_subset$AvgCqVal_Trichuris <- ifelse(shotgun_metadata_cameroon_21319$PosOrNeg_Trichuris == "Positive", shotgun_metadata_cameroon_21319$AvgCqVal_Trichuris, NA)
+
+
+CM_US_metadata_subset <- as.data.frame(CM_US_metadata_subset)
+
+#Deselect 
+rownames(CM_US_metadata_subset) <- CM_US_metadata_subset$sampleID
+
+View(CM_US_metadata_subset)
+CM_US_metadata_subset$Population[373] <- 'Mbororo_Fulani'
+CM_US_metadata_subset$Population[1:37] <- 'USA'
+CM_US_metadata_subset$sampleID <- NULL
+
+CM_US_metadata_subset <- as.data.frame(t(CM_US_metadata_subset))
+dim(CM_US_metadata_subset)
+
+CM_US_metadata_subset <- as.data.frame(CM_US_metadata_subset)
+
+CM_US_metadata_subset <- subset(CM_US_metadata_subset, select = -c(`cytokine_high20-557`, `cytokine_high564-1293`, `cytokine_low20_557`, `cytokine_low564_1293`, `LibNeg1`, `LibNeg2`,`EB110`, `EB73`, `EB1`, `EB105`, `EB19`, `EB56`, `EB55`, `PCR1`, `PCR2`, `PCR3`, `PCR4`, `V4GBlock1`, `V4GBlock2`, `V4GBlock3`, `V4GBlock4`))
+
+CM_US_metadata_subset$AvgCqVal_Trichuris <- as.integer(CM_US_metadata_subset$AvgCqVal_Trichuris)
+CM_US_metadata_subset$AvgCqVal_Ancylostoma <- as.integer(CM_US_metadata_subset$AvgCqVal_Ancylostoma)
+CM_US_metadata_subset$AvgCqVal_Strongyloides <- as.integer(CM_US_metadata_subset$AvgCqVal_Strongyloides)
+CM_US_metadata_subset$AvgCqVal_PanCrypto <- as.integer(CM_US_metadata_subset$AvgCqVal_PanCrypto)
+CM_US_metadata_subset$AvgCqVal_Entamoeba <- as.integer(CM_US_metadata_subset$AvgCqVal_Entamoeba)
+CM_US_metadata_subset$AvgCqVal_Ascaris <- as.integer(CM_US_metadata_subset$AvgCqVal_Ascaris)
+CM_US_metadata_subset$AvgCqVal_Giardia <- as.integer(CM_US_metadata_subset$AvgCqVal_Giardia)
+CM_US_metadata_subset$AvgCqVal_Necator <- as.integer(CM_US_metadata_subset$AvgCqVal_Necator)
+
+heatmap_CMUS_temp_qpcr <- pheatmap(subpropnocntrl_subset, color= colorRampPalette(brewer.pal(n=7, name = "Reds"))(100), annotation_col = CM_US_metadata_subset, annotation_colors = ann_colors, clustering_method = "ward.D2", filename= "heatmap_qpcr.pdf", width = 15, height = 10)
+
+#Using z scores
+heatmap_CMUS_qPCR <- pheatmap(data_subset_norm, color= colorRampPalette(brewer.pal(n=7, name = "Reds"))(100), annotation_col = CM_US_metadata_subset, annotation_colors = ann_colors)
+
+```
+###Bantu only Analysis###
+###============================
+```{r}
+library(readxl)
+FULL_CM_metadata_9618 <- read_excel("FULL_CM_metadata_9618.xlsx")
+View(FULL_CM_metadata_9618)
+CM_US_metadata <- as.data.frame(FULL_CM_metadata_9618)
+
+shotgun_CM_US_metadata  <-read.delim("/media/lorax/users/marubel/V4_ANALYSIS/shotgun_metadata_cameroon_42619.csv", sep=",", header=TRUE)
+
+shotgunslice <- dplyr::select(shotgun_CM_US_metadata, sampleID, Population, ants_binary)
+shotgunslice <- shotgunslice %>% filter(str_detect(sampleID, "^D"))
+
+drops <- c("D0027", "D0056","D0071","D0081","D0410","D0523","D0785","D0890","D0911","D0970","D1193","D1218","D1224", "D1250","D1296","D0911","D0523","D0056")
+shotgunslice <- shotgunslice %>% filter(!(sampleID %in% drops))
+colnames(shotgunslice)[1] <- c("SampleID")
+shotgunslice$Population[325] <- "Mbororo_Fulani"
+shotgunslice$Population <- droplevels(shotgunslice$Population)
+
+CM_antsbinary <- shotgunslice
+rownames(CM_antsbinary) <- shotgunslice[,1]
+#CM_antsbinary$ants_binary.x <- NULL
+#CM_antsbinary$ants_binary.y <- NULL
+
+CM_antsbinary_Bantu <- CM_antsbinary %>% dplyr::filter(Population == "Bantu")
+rownames(CM_antsbinary_Bantu) <- CM_antsbinary_Bantu[,1]
+Bantu <- list(c(CM_antsbinary_Bantu$SampleID))
+
+###Start counts file manipulation here###
+
+counts4 <- as.data.frame(counts4)
+#CM_only <- CM_US_metadata[-1:-37,] #makes df of CM only, no US
+
+counts5.1<- select(counts4, -starts_with('3'))
+#counts5 <-subset(counts5, select = -c(D0911, D0523, D0056))
+
+counts5 <- select(counts4, CM_antsbinary_Bantu$SampleID)
+CM_antsbinary_Bantu <- CM_antsbinary_Bantu[,-1]
+
+counts6 <- as.matrix(counts5)
+
+#check that rownames are the same between taxonomic table and otu counts
+
+#Jesse- you can just modify indx_cts3 to be rowSums(counts3)>0 so it's a working index vector on the full-length variables (instead of rowSums(counts4) which'll be working with a shortened form already).  You need a vector that has one logical value for every position in the original ta/counts, so it'll need to be 14138 long, with 13808 TRUE and the rest FALSE.  Then after doing ta[indx_cts3, ] you'll only have 13808 rows in ta3. Does that make sense?
+#hmm or you can base index_cts4 on counts6 instead of 7, and then use ta3 instead of ta (if I'm tracking the variables corectly)since nrow(ta3) == nrow(counts6) and it looks like their rows should match up
+
+counts7 <- counts6[rowSums(counts6)>0,]
+index_cts4 <- rowSums(counts6)>0
+str(index_cts4)
+ta4 <- ta3[index_cts4,] #this isn't working
+
+#test <- dplyr::filter(ta4,`Feature ID` %in% rownames(counts7))
+
+      
+if(!all((ta4$`Feature ID`)==((rownames(counts7))))) stop("Row names don't match")
+
+
+#Only include ASVs in ta that match ASVs in counts 
+
+ta4 <- as.data.frame(ta4)
+ta4 <- split_assignments(ta4$trunc_taxon)
+rownames(ta4) <-rownames(counts7)
+
+rownames(counts7) %in% rownames(ta4)
+
+ta4 <- as.matrix(ta4)
+counts7 <- as.matrix(counts7)
+
+OTU = otu_table(counts7, taxa_are_rows = TRUE)
+TAX = tax_table(ta4)
+physeq = phyloseq(OTU, TAX)
+physeq
+
+###append sample metadata###
+#CM_antsbinary_Bantu <- t(CM_antsbinary_Bantu)
+
+sampledata3 = sample_data(data.frame(CM_antsbinary_Bantu,
+  rownames = sample_names(physeq),
+  stringsAsFactors=FALSE
+))
+
+
+physeq_CM = merge_phyloseq(physeq, sampledata3)
+
+#sampledata2$ratio <- ratio
+#sample_data(physeq1) <- sampledata3
+
+#################################################
+###BRAY CURTIS/JACCARD/PERMANOVA BANTU ONLY###
+#################################################
+
+dist_bray <- distance(physeq_CM, method = "bray") #Bray-Curtis Metric/Divergence - abundance
+dist_js <- distance(physeq_CM, method="jsd") #Jensen-Shannon Divergence- abundance
+dist_rjs <- sqrt(dist_js) #Jensen-Shannon Distance
+dist_jac <-distance(physeq_CM, method="jaccard", binary = TRUE) #- presence/absence
+ord_bray <- ordinate(physeq_CM, method="PCoA", distance=dist_bray)
+ord_JS  <- ordinate(physeq_CM, method="PCoA", distance=dist_js)
+ord_RJS <- ordinate(physeq_CM, method="PCoA", distance=dist_rjs)
+ord_jac <- ordinate(physeq_CM, method="PCoA", distance=dist_jac)
+
+
+plot_ordination(physeq_CM, ord_bray, color="Total_ANTS") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +     scale_color_manual(values=c('0' = '#3500BF', '1' = '#00A8BF', '2' = '#07BF00', '3' = '#BF9A00', '4' = '#BF0042')) + theme_bw()
+
+#ANTS only 
+ANTS_physeq<- plot_ordination(physeq_CM, ord_bray, color="Total_ANTS") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +
+scale_color_viridis(option = "inferno", end = .8, direction = -1) + theme_bw()
+
+#ANTS and sampling site
+ANTS_physeq<- plot_ordination(physeq_CM, ord_bray, color="Total_ANTS", shape = "Sampling.Site") + 
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS Parasite Count") +
+scale_shape_manual(values=c("Aviation" = 19, "Bidou_I" = 19, "Bosquet" = 19, "Missoume" = 19, "Ndtoua" =19, "Njibot" = 19,"Nkolbikong"=19,"Ntambang"=8,"Sabga"=8)) +
+scale_color_viridis(option = "inferno", end = .8, direction = -1) + theme_bw()
+
+#Plot bray curtis distances on ants binary
+
+ANTS_binary_physeq <- plot_ordination(physeq_CM, ord_bray, color= "Population", shape = "ants_binary") +
+ggplot2::ggtitle("Bacterial Abundance, colored by ANTS status") +
+scale_shape_manual(values = c("Positive"= 17, "Negative"= 24),na.value="#ffffff") +
+scale_color_manual(values = c("Bantu" ="#ffcc99"), na.value="#ffffff") +
+geom_point(size = 5) +theme_bw()
+
+adonis(distance(physeq_CM, method="bray",)~ants_binary, data= CM_antsbinary_Bantu)
+
+library(vegan)
+veganotu = function(physeq) {
+    require("vegan")
+    OTU = otu_table(physeq)
+    if (taxa_are_rows(OTU)) {
+        OTU = t(OTU)
+    }
+    return(as(OTU, "matrix"))
+}
+
+#keepvariables = which(sapply(sample_data(physeq_CM), is.numeric))
+#physeq_CMsd = data.frame(sample_data(physeq_CM))[keepvariables]
+otu <- veganotu(physeq_CM)
+
+
+wilcox.test(otu ~ CM_antsbinary_Bantu$ants_binary, data = otu)
+
+
+
+################
+##############################################################
+#RUN PAIRWISE PERMANOVA ON BRAY CURTIS V4 MICROBIOME DISTANCES
+##############################################################
+
+#Get counts table and make sure that taxa(columns) equal 13816 and samples(rows) are 612, taxa are colnames and sampleIDs are rownames
+#Replace rownames of counts4 with column 'trunc_taxon' of ta, based on 'Feature ID' in ta matching rowname in counts4
+
+counts5<-counts4
+rownames(counts5)<-ta$trunc_taxon[match(rownames(counts4), ta$'Feature ID')]
+nrow(counts5) #gives 13772 what!? Does not match
+
+counts5 <- as.data.frame(counts5)
+
+#for age- this is a continuous variable and testing as groups in adonis is not plausible. Could bin kids and adults in to separate groups. WHO recommends deworming up to age 14 in areas wehre helminth prevalence is at or more than 20%. https://www.who.int/elena/titles/deworming/en/ Group 1 could be all kids ages 4-14; separately, all 15+ US and 15+ CM. Calls this variable "Age_Bin"
+
+1. Need to mutate Age into new col where all samples from US go to ">15_US" in new column "Age_Groups." All samples not >15_US and that are ages 4-14 become "4-14_CM" and all samples not ">15_US" and not "4-14_CM" become ">15_CM"
+
+Age_Groups <- (ifelse(CM_US_metadata$Age < 15, "4-14_CM",">15_CM")) #Creates a new vector of age groups
+Age_Groups[1:37] <- ">15_US" #Changes first 37 (all US) to be >15 US
+CM_US_metadata <- cbind(CM_US_metadata, Age_Groups) #Binds this column to US metadata frame
+
+#Problem: **$Population and cts files aren't matched by sampleID/rownames. Cts file has sampleID as rownames. CM_US_metadata has SampleID as its own column. 
+#Solution: 
+
+2) Make rownames in cts a column (duplicate) so that you have a row of SampleID
+
+summed_cts_2t <- t(summed_cts_2) 
+summed_cts_2t <- as.data.frame(summed_cts_2t)
+summed_cts_3t <- summed_cts_2t
+summed_cts_3t$SampleID <- rownames(summed_cts_2t) 
+summed_cts_3t$Population <- NA #Makes a dummy Population column
+summed_cts_3t$Sampling.Site <- NA 
+summed_cts_3t$Age <- NA 
+summed_cts_3t$Sex <- NA 
+summed_cts_3t$Subsistence <- NA 
+
+3) Merge only the population information from CM_US_metadata into summed props by SampleID. Should produce a data frame that has column 1 as SampleID, all columns to the right as taxa, final column as Population
+
+summed_cts_4t <- merge(summed_cts_3t, CM_US_metadata[, c("SampleID","Population", "Sampling.Site","Age","Sex","Subsistence", "Age_Groups")], by="SampleID")
+
+#Spot check a few samples so that you are sure Population matches sampleID
+
+4) Remove SampleID column from cts
+
+summed_cts_4t$SampleID <- NULL #Removes column of SampleID, since these are already rownames
+summed_cts_4t$Population.x <- NULL #Removes Population.x, which is NULL column, repeat for other NULL *.x columns below
+summed_cts_4t$Subsistence.x <- NULL
+summed_cts_4t$Sex.x <- NULL
+summed_cts_4t$Sampling.Site.x <- NULL
+summed_cts_4t$Age_Groups.x <- NULL
+summed_cts_4t$Age.x <- NULL
+summed_cts_4t$Age.y <- NULL
+
+
+colnames(summed_cts_4t)[480] <- c("Population") #changes Population.y column to Population. Repeat for the rest. 
+colnames(summed_cts_4t)[481] <- c("Sampling.Site") #changes Sampling.Site.y column to Population. Repeat for the rest. 
+colnames(summed_cts_4t)[482] <- c("Sex") #changes Sex.y column to Population. Repeat for the rest. 
+colnames(summed_cts_4t)[483] <- c("Subsistence") #changes Subsistence.y column to Population. Repeat for the rest. 
+
+
+summed_cts_4t$Population[362] <- 'Mbororo_Fulani' #This is always wrong. Change and check levels!
+
+summed_cts_4t$Population <- as.factor(summed_cts_4t$Population)
+levels(summed_cts_4t$Population)
+droplevels(summed_cts_4t$Population, 'Pastoralist')
+
+summed_cts_4t$Subsistence <- as.factor(summed_cts_4t$Subsistence)
+levels(summed_cts_4t$Subsistence)
+
+summed_cts_4t$Sex <- as.factor(summed_cts_4t$Sex)
+levels(summed_cts_4t$Sex)
+
+summed_cts_4t$Sampling.Site <- as.factor(summed_cts_4t$Sampling.Site)
+levels(summed_cts_4t$Sampling.Site)
+
+summed_cts_4t$Age_Groups <- as.factor(summed_cts_4t$Age_Groups)
+levels(summed_cts_4t$Age_Groups)
+
+5) Double check that all columns save Population are numeric. Population should be factored. Then proceed with rest of steps (check for relevant levels, drop unused levels, etc.)
+
+5) Run pairwise adonis
+# pairwise.adonis(iris[,1:4],iris$Species) #example
+
+Pop_pair_adonis <- pairwise.adonis(summed_cts_4t[,1:479], summed_cts_4t$Population) %>% as.data.frame()
+
+Sex_pair_adonis <- pairwise.adonis(summed_cts_4t[,1:479], summed_cts_4t$Sex) %>% as.data.frame()
+
+Age_pair_adonis <- pairwise.adonis(summed_cts_4t[,1:479], summed_cts_4t$Age_Groups) %>% as.data.frame()
+
+SamplingSite_pair_adonis <- pairwise.adonis(summed_cts_4t[,1:479], summed_cts_4t$Sampling.Site) %>% as.data.frame()
+
+Subsistence_pair_adonis <- pairwise.adonis(summed_cts_4t[,1:479], summed_cts_4t$Subsistence) %>% as.data.frame()
+
+
+
+
+5) Append all results for Population, Subsistence, Age, Sex, and Sampling Site to a single dataframe
+
+All_adonis_cts <- merge(Pop_pair_adonis, Sex_pair_adonis, by= "pairs", all=T) #Binds this column to US metadata frame
+
+All_adonis_cts <- merge(All_adonis_cts, Age_pair_adonis, by="pairs", all=T)
+
+All_adonis_cts <- merge(All_adonis_cts, SamplingSite_pair_adonis, by="pairs", all=T)
+
+All_adonis_cts <- merge(All_adonis_cts, Subsistence_pair_adonis, by="pairs", all=T)
+
+
+7) Repeat this separately for summed proportions  (summed_props)
+
+
+summed_props_2 <- summed_props
+summed_props_2t <- t(summed_props_2)
+summed_props_2t <- as.data.frame(summed_props_2t)
+summed_props_3t <- summed_props_2t
+summed_props_3t$SampleID <- rownames(summed_props_2t) 
+summed_props_3t$Population <- NA #Makes a dummy Population column
+summed_props_3t$Sampling.Site <- NA 
+summed_props_3t$Age <- NA 
+summed_props_3t$Sex <- NA 
+summed_props_3t$Subsistence <- NA
+summed_props_4t <- merge(summed_props_3t, CM_US_metadata[, c("SampleID","Population", "Sampling.Site","Age","Sex","Subsistence", "Age_Groups")], by="SampleID")
+summed_props_4t$SampleID <- NULL #Removes column of SampleID, since these are already rownames
+summed_props_4t$Population.x <- NULL #Removes Population.x, which is NULL column, repeat for other NULL *.x columns below
+summed_props_4t$Subsistence.x <- NULL
+summed_props_4t$Sex.x <- NULL
+summed_props_4t$Sampling.Site.x <- NULL
+summed_props_4t$Age_Groups.x <- NULL
+summed_props_4t$Age.x <- NULL
+summed_props_4t$Age.y <- NULL
+colnames(summed_props_4t)[485] <- c("Population") #changes Population.y column to Population. Repeat for the rest. 
+colnames(summed_props_4t)[486] <- c("Sampling.Site") #changes Sampling.Site.y column to Population. Repeat for the rest. 
+colnames(summed_props_4t)[487] <- c("Sex") #changes Sex.y column to Population. Repeat for the rest. 
+colnames(summed_props_4t)[488] <- c("Subsistence") #changes Subsistence.y column to Population. Repeat for the rest. 
+
+summed_props_4t$Population[362] <- 'Mbororo_Fulani' #This is always wrong. Change and check levels!
+
+summed_props_4t$Population <- as.factor(summed_props_4t$Population)
+levels(summed_props_4t$Population)
+droplevels(summed_props_4t$Population, 'Pastoralist')
+
+summed_props_4t$Subsistence <- as.factor(summed_props_4t$Subsistence)
+levels(summed_props_4t$Subsistence)
+
+summed_props_4t$Sex <- as.factor(summed_props_4t$Sex)
+levels(summed_props_4t$Sex)
+
+summed_props_4t$Sampling.Site <- as.factor(summed_props_4t$Sampling.Site)
+levels(summed_props_4t$Sampling.Site)
+
+summed_props_4t$Age_Groups <- as.factor(summed_props_4t$Age_Groups)
+levels(summed_props_4t$Age_Groups)
+
+Pop_pair_adonis_p <- pairwise.adonis(summed_props_4t[,1:484], summed_props_4t$Population) %>% as.data.frame()
+
+Sex_pair_adonis_p <- pairwise.adonis(summed_props_4t[,1:484], summed_props_4t$Sex) %>% as.data.frame()
+
+Age_pair_adonis_p <- pairwise.adonis(summed_props_4t[,1:484], summed_props_4t$Age_Groups) %>% as.data.frame()
+
+SamplingSite_pair_adonis_p <- pairwise.adonis(summed_props_4t[,1:484], summed_props_4t$Sampling.Site) %>% as.data.frame()
+
+Subsistence_pair_adonis_p <- pairwise.adonis(summed_props_4t[,1:484], summed_props_4t$Subsistence) %>% as.data.frame()
+
+
+All_adonis_prop <- merge(Pop_pair_adonis_p, Sex_pair_adonis_p, by= "pairs", all=T) #Binds this column to US metadata frame
+
+All_adonis_prop <- merge(All_adonis_prop, Age_pair_adonis_p, by="pairs", all=T)
+
+All_adonis_prop <- merge(All_adonis_prop, SamplingSite_pair_adonis_p, by="pairs", all=T)
+
+All_adonis_prop <- merge(All_adonis_prop, Subsistence_pair_adonis_p, by="pairs", all=T)
+
+#Function for pairwise permanova
+##start copy here for function pairwise.adonis()
+pairwise.adonis <- function(x,factors, sim.function = 'vegdist', sim.method = 'bray', p.adjust.m ='bonferroni')
+{
+library(vegan)
+
+co = combn(unique(as.character(factors)),2)
+pairs = c()
+F.Model =c()
+R2 = c()
+p.value = c()
+
+
+for(elem in 1:ncol(co)){
+if(sim.function == 'daisy'){
+library(cluster); x1 = daisy(x[factors %in% c(co[1,elem],co[2,elem]),],metric=sim.method)
+} else{x1 = vegdist(x[factors %in% c(co[1,elem],co[2,elem]),],method=sim.method)}
+
+ad = adonis(x1 ~ factors[factors %in% c(co[1,elem],co[2,elem])] );
+pairs = c(pairs,paste(co[1,elem],'vs',co[2,elem]));
+F.Model =c(F.Model,ad$aov.tab[1,4]);
+R2 = c(R2,ad$aov.tab[1,5]);
+p.value = c(p.value,ad$aov.tab[1,6])
+}
+p.adjusted = p.adjust(p.value,method=p.adjust.m)
+sig = c(rep('',length(p.adjusted)))
+sig[p.adjusted <= 0.05] <-'.'
+sig[p.adjusted <= 0.01] <-'*'
+sig[p.adjusted <= 0.001] <-'**'
+sig[p.adjusted <= 0.0001] <-'***'
+
+pairw.res = data.frame(pairs,F.Model,R2,p.value,p.adjusted,sig)
+print("Signif. codes:  0 â***â 0.001 â**â 0.01 â*â 0.05 â.â 0.1 â â 1")
+return(pairw.res)
+
+} 
+```
+###PCA on Cytokine Values, color by metadatavar
+###==========================================
+```{r}
+library(ggfortify)
+
+#autoplot(prcomp(df), data = iris, colour = 'Species')
+
+shotgun_CM_US_metadata  <-read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/shotgun_metadata_cameroon_4219.csv", sep=",", header=TRUE)
+
+shotgunslice <- dplyr::filter(shotgun_CM_US_metadata, Cytokine_Testing_Done == 'Yes')
+
+shotgunslice <- dplyr::select(shotgunslice, TNFa, GM.CSF, ITAC, IFNg, IL.17a, IL.4, IL.23, IL.10, IL.8, IL.21, MIP.3a, IL.13, IL.5, MIP.1b, IL.1b, IL.2, IL.7, IL.12p70, IL.6, Fractalkine)
+
+dim(shotgunslice)
+shotgunslice <-na.omit(shotgunslice)
+shotgunslice <- as.data.frame(shotgunslice)
+dim(shotgunslice)
+shotgunslice1 = as.matrix(as.data.frame(lapply(shotgunslice, as.numeric)))
+#shotgunslice.numeric[,21] <- shotgunslice$ants_binary 
+PC <- autoplot(prcomp(df), data= shotgunslice1)
+PCi<-data.frame(PC$x, ants_binary=shotgunslice$ants_binary)
+
+ggplot(PCi,aes(x=PC1,y=PC2,col= shotgunslice$ants_binary))+
+   geom_point(size=3,alpha=0.5)+ theme_bw()
+   
+   #Size and alpha just for fun
+   scale_color_manual(values = c("#FF1BB3","#A7FF5B","#99554D"))+ #your colors here
+   theme_classic()
+```
+###Stacked Barcharts of Weighted Bacterial Abudance for V4###
+###===========================================================
+```{r}
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#s <- read_qiime_mapping_file("tishkoff_microbiome_v4.txt")
+#o <- read_qiime_otu_table("swarm_otu_defaults_filtered/classic_otu_table_nosingdoub.txt")
+#cts <- o$counts[,s$SampleID]
+#props <- sweep(cts, 2, colSums(cts), `/`)
+#otu.melt <- melt(props, varnames=c("otu", "SampleID"))
+```
+
+###Top15 Families Barchart###
+###=======================================================
+```{r}
+###ASV counts
+counts <- readr::read_delim(feature_table_fp, skip=1, delim="\t") %>%
+  column_to_rownames(var = "#OTU ID") %>%
+  as.matrix()
+
+### taxonomic assignment
+ta <- read_delim(file=taxo_assignment_fp, delim="\t") %>%
+  mutate(trunc_taxon = sub("(; [kpcofgs]__)+$", "", Taxon, perl=T)) %>%
+  arrange(order(match(rownames(counts), `Feature ID`)))
+
+adf <- split_assignments(ta$trunc_taxon) 
+
+###modify metadata 
+CM_US_metadata  <-read.delim("/media/lorax/users/marubel/05_CM_16SV4_Analysis/shotgun_metadata_cameroon_42619.csv", sep=",", header=TRUE)
+
+CM_US_metadata$X <- NULL
+
+rownames(CM_US_metadata) <- CM_US_metadata$sampleID
+
+CM_US_metadata <- CM_US_metadata[,-1]
+
+CM_US_metadata_t <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata <- subset(CM_US_metadata_t, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, EB3, EB75, EB47, EB119, LibNeg1, LibNeg2, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4, `cytokine_high20-557`, `cytokine_high564-1293`, cytokine_low20_557, cytokine_low564_1293,D0911, D0523, D0056, D0027, D0071, D0081, D0410, D0785, D0890, D0970, D1193, D1218, D1224, D1250,D1296)) #currently has sampleIDs as columns
+
+CM_US_metadata <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata$Subsistence <- factor(CM_US_metadata$Subsistence, levels= c("Agropastoralist", "Industrial_Agropastoralist", "Hunter-Gatherer", "Pastoralist"))
+CM_US_metadata$Subsistence[362] <- "Pastoralist"
+CM_US_metadata$Subsistence[1:37] <- "Industrial_Agropastoralist"
+CM_US_metadata$Subsistence <- droplevels(CM_US_metadata$Subsistence)
+
+CM_US_metadata$Population <- factor(CM_US_metadata$Population, levels= c("Baka", "Bantu", "Mbororo_Fulani", "Bagyeli", "USA"))
+CM_US_metadata$Population[1:37] <- "USA"
+#CM_US_metadata$Population<- droplevels(CM_US_metadata$Population)
+
+CM_US_metadata$Sampling.Site <- factor(CM_US_metadata$Sampling.Site, levels= c("USA", "Aviation", "Bidou_I", "Bosquet", "Missoume", "Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga"))
+CM_US_metadata$Sampling.Site[1:37]<- "USA"
+#CM_US_metadata$Sampling.Site<- #droplevels(CM_US_metadata$Sampling.Site)
+dim(CM_US_metadata)
+
+###build counts data frame for barplot
+b <- simplify_assignments(adf, rank1="Family", rank2 = FALSE)
+names(b) <- ta$`Feature ID`
+
+b <- sub(" +$", "", b) #regex to remove trailing space after taxa
+
+summed_cts <- rowsum(counts, b) 
+summed_cts <-subset(summed_cts, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props2 <- as.data.frame(t(summed_props))
+#summed_props2 <- summed_props[rowSums(summed_props) >0.01,] #filter on rows that are greater than 1% across all samples
+summed_props3 <- dplyr::mutate(summed_props2, Population = CM_US_metadata$Population)
+rownames(summed_props3) <- rownames(summed_props2)
+
+grouped <- summed_props3 %>% group_by(Population) %>% summarise_all(funs(median)) 
+grouped <- grouped[1:5,]#always double check this for population #s
+
+#renorm_by_pop <- function(df) {
+ # colidx <- match("Population", colnames(df))
+  #df[, -colidx] <- sweep(df[, -colidx], 1, rowSums(df[, -colidx]), "/")
+#  df
+#}
+#grouped <- renorm_by_pop(grouped)
+
+grouped <- as.data.frame(grouped)
+
+groupedmelt <- melt(grouped,value.name ="prop", variable.name = "taxon") 
+
+groupedmelt$taxon <- as.character(groupedmelt$taxon)
+
+groupedmelt <- as.data.frame(groupedmelt)
+
+#test <- groupedmelt %>% dplyr::filter(grepl("f__", variable))
+
+groupedmelt <- groupedmelt %>% dplyr::filter(!grepl("Unassigned", taxon))
+
+groupedfinal <- groupedmelt %>% dplyr::group_by(Population, taxon) %>%
+  dplyr::summarise(prop = sum(prop)) 
+
+###Visualize firmicutes to bacteroidetes ratios per pop including US
+pick=15
+
+groupedmelt_phylum_pick <- groupedfinal %>% 
+  dplyr::group_by(Population) %>%
+  dplyr::filter(grepl("p__", taxon)) %>%
+  dplyr::top_n(15, wt=prop) %>%
+  dplyr::arrange(Population, desc(prop))
+
+#Set manual color list for taxa
+
+b_pick_col <- c(
+  "p__Bacteroidetes" = "#9a0046", 
+  "p__Bacteroidetes" = "#d60A13")
+,
+  "f__Bifidobacteriaceae" = "#9400D3", 
+  "f__Christensenellaceae" = "#800080", 
+  "f__Clostridiaceae" = "#a6e57c",
+  "f__Coriobacteriaceae" = "#02e8c1", 
+  "f__Desulfovibrionaceae" = "#3b085f",
+  "f__Enterobacteriaceae" = "#d7d982",
+  "f__Erysipelotrichaceae" = "#e56cd9",
+  "f__Lachnospiraceae" = "#014421",
+  "f__[Odoribacteraceae]" = "#cb4623",
+  "f__[Paraprevotellaceae]" = "#3b085f", 
+  "f__[Mogibacteriaceae]" = "#4b4cbf",
+  "f__Porphyromonadaceae" = "#7deaa1",
+  "f__Prevotellaceae" = "#3E12F3",
+  "f__Rikenellaceae" = "#b00079",
+  "f__Ruminococcaceae" = "#ff9a00", 
+  "f__[Barnesiellaceae]" = "#67a0ff", 
+  "f__S24-7" = "#a10e0b", 
+  "f__Succinivibrionaceae" ="#be1539",
+  "f__Veillonellaceae" = "#ff95a3")
+
+#Plot bar chart
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Heatmap
+theme_aa_heatmap <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        strip.background.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+#Barchart
+theme_aa_bars <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+groupedmelt_phylum_pick %$% 
+  ggplot(data = ., aes(x = Population)) +
+  facet_grid(~ Population, scales = "free", 
+              space = "free") +
+  geom_col(aes(y = prop, fill = taxon), width = 2) + #adding in position = "fill" moves bars to full size, no grey
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = "15 Most Abundant Bacterial Families per  Population", values = b_pick_col) +
+    labs(x= "Population", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))+
+  theme(legend.position="none")
+###
+
+pick=15
+
+groupedmelt_fam_pick <- groupedfinal %>% 
+  dplyr::group_by(Population) %>%
+  dplyr::filter(grepl("f__", taxon)) %>%
+  dplyr::top_n(15, wt=prop) %>%
+  dplyr::arrange(Population, desc(prop))
+
+#Set manual color list for taxa
+
+b_pick_col <- c(
+  "f__Alcaligenaceae" = "#9a0046", 
+  "f__Bacteroidaceae" = "#d60A13",
+  "f__Bifidobacteriaceae" = "#9400D3", 
+  "f__Christensenellaceae" = "#800080", 
+  "f__Clostridiaceae" = "#a6e57c",
+  "f__Coriobacteriaceae" = "#02e8c1", 
+  "f__Desulfovibrionaceae" = "#3b085f",
+  "f__Enterobacteriaceae" = "#d7d982",
+  "f__Erysipelotrichaceae" = "#e56cd9",
+  "f__Lachnospiraceae" = "#014421",
+  "f__[Odoribacteraceae]" = "#cb4623",
+  "f__[Paraprevotellaceae]" = "#3b085f", 
+  "f__[Mogibacteriaceae]" = "#4b4cbf",
+  "f__Porphyromonadaceae" = "#7deaa1",
+  "f__Prevotellaceae" = "#3E12F3",
+  "f__Rikenellaceae" = "#b00079",
+  "f__Ruminococcaceae" = "#ff9a00", 
+  "f__[Barnesiellaceae]" = "#67a0ff", 
+  "f__S24-7" = "#a10e0b", 
+  "f__Succinivibrionaceae" ="#be1539",
+  "f__Veillonellaceae" = "#ff95a3")
+
+#Plot bar chart
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Heatmap
+theme_aa_heatmap <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        strip.background.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+#Barchart
+theme_aa_bars <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+#Scatterplot
+theme_aa_scatter <- theme_bw(base_size = 20) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+
+
+groupedmelt_fam_pick %$% 
+  ggplot(data = ., aes(x = Population)) +
+  facet_grid(~ Population, scales = "free", 
+              space = "free") +
+  geom_col(aes(y = prop, fill = taxon), width = 2) + #adding in position = "fill" moves bars to full size, no grey
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = "15 Most Abundant Bacterial Families per Population", 
+                    values = b_pick_col) +
+    labs(x= "Population", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))+
+  theme(legend.position="none")
+
+```
+###Top 15 Genera Barchart
+###======================
+
+```{r Stacked_barchart_family_filtered, fig.height=9}
+
+###=======================================================
+```{r}
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#s <- read_qiime_mapping_file("tishkoff_microbiome_v4.txt")
+#o <- read_qiime_otu_table("swarm_otu_defaults_filtered/classic_otu_table_nosingdoub.txt")
+#cts <- o$counts[,s$SampleID]
+#props <- sweep(cts, 2, colSums(cts), `/`)
+#otu.melt <- melt(props, varnames=c("otu", "SampleID"))
+
+###barplots across Bantu, by sampling site. GENERA
+
+###ASV counts
+counts <- readr::read_delim(feature_table_fp, skip=1, delim="\t") %>%
+  column_to_rownames(var = "#OTU ID") %>%
+  as.matrix()
+
+### taxonomic assignment
+ta <- read_delim(file=taxo_assignment_fp, delim="\t") %>%
+  mutate(trunc_taxon = sub("(; [kpcofgs]__)+$", "", Taxon, perl=T)) %>%
+  arrange(order(match(rownames(counts), `Feature ID`)))
+
+adf <- split_assignments(ta$trunc_taxon) 
+
+###modify metadata 
+CM_US_metadata  <-read.delim("/media/lorax/users/marubel/V4_ANALYSIS/shotgun_metadata_cameroon_42619.csv", sep=",", header=TRUE)
+
+CM_US_metadata$X <- NULL
+
+rownames(CM_US_metadata) <- CM_US_metadata$sampleID
+
+CM_US_metadata <- CM_US_metadata[,-1]
+
+CM_US_metadata_t <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata <- subset(CM_US_metadata_t, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, EB3, EB75, EB47, EB119, LibNeg1, LibNeg2, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4, `cytokine_high20-557`, `cytokine_high564-1293`, cytokine_low20_557, cytokine_low564_1293,D0911, D0523, D0056, D0027, D0071, D0081, D0410, D0785, D0890, D0970, D1193, D1218, D1224, D1250,D1296)) #currently has sampleIDs as columns
+
+CM_US_metadata <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata$Subsistence <- factor(CM_US_metadata$Subsistence, levels= c("Agropastoralist", "Industrial_Agropastoralist", "Hunter-Gatherer", "Pastoralist"))
+CM_US_metadata$Subsistence[362] <- "Pastoralist"
+CM_US_metadata$Subsistence[1:37] <- "Industrial_Agropastoralist"
+CM_US_metadata$Subsistence <- droplevels(CM_US_metadata$Subsistence)
+
+CM_US_metadata$Population <- factor(CM_US_metadata$Population, levels= c("Baka", "Bantu", "Mbororo_Fulani", "Bagyeli", "USA"))
+CM_US_metadata$Population[1:37] <- "USA"
+CM_US_metadata$Population[362] <- "Mbororo_Fulani"
+#CM_US_metadata$Population<- droplevels(CM_US_metadata$Population)
+
+CM_US_metadata$Sampling.Site <- factor(CM_US_metadata$Sampling.Site, levels= c("USA", "Aviation", "Bidou_I", "Bosquet", "Missoume", "Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga"))
+CM_US_metadata$Sampling.Site[1:37]<- "USA"
+#CM_US_metadata$Sampling.Site<- #droplevels(CM_US_metadata$Sampling.Site)
+dim(CM_US_metadata)
+
+
+###build counts data frame for barplot
+b <- simplify_assignments(adf, rank1="Genus", rank2 = FALSE)
+names(b) <- ta$`Feature ID`
+
+b <- sub(" +$", "", b) #regex to remove trailing space after taxa
+
+summed_cts <- rowsum(counts, b) 
+summed_cts <-subset(summed_cts, select = -c(D0056,D0523,D0911,EB110, EB73, EB1, EB105, EB19, EB56, EB55, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4))
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props2 <- as.data.frame(t(summed_props))
+#summed_props2 <- summed_props[rowSums(summed_props) >0.01,] #filter on rows that are greater than 1% across all samples
+summed_props3 <- dplyr::mutate(summed_props2, Population = CM_US_metadata$Population)
+rownames(summed_props3) <- rownames(summed_props2)
+
+grouped <- summed_props3 %>% group_by(Population) %>% summarise_all(funs(median)) 
+grouped <- grouped[1:5,]#always double check this for population #s
+
+#renorm_by_pop <- function(df) {
+ # colidx <- match("Population", colnames(df))
+  #df[, -colidx] <- sweep(df[, -colidx], 1, rowSums(df[, -colidx]), "/")
+#  df
+#}
+#grouped <- renorm_by_pop(grouped)
+
+grouped <- as.data.frame(grouped)
+
+groupedmelt <- melt(grouped,value.name ="prop", variable.name = "taxon") 
+
+groupedmelt$variable <- as.character(groupedmelt$taxon)
+
+groupedmelt <- as.data.frame(groupedmelt)
+
+#test <- groupedmelt %>% dplyr::filter(grepl("f__", variable))
+
+#groupedmelt <- groupedmelt %>% dplyr::filter(!grepl("Unassigned", variable))
+
+groupedmelt$variable <- gsub('g__[Prevotella]', 'g__Prevotella', groupedmelt$variable, fixed = TRUE)
+
+groupedmelt$variable <- gsub('g__[Ruminococcus]', 'g__Ruminococcus', groupedmelt$variable, fixed = TRUE)
+
+groupedfinal <- groupedmelt %>% dplyr::group_by(Population, variable) %>%
+  dplyr::summarise(prop = sum(prop)) 
+
+
+pick=15
+
+groupedmelt_gen_pick <- groupedfinal %>% 
+  dplyr::group_by(Population) %>%
+  dplyr::filter(grepl("g__", variable)) %>%
+  dplyr::top_n(15, wt=prop) %>%
+  dplyr::arrange(Population, desc(prop))
+
+groupedmelt_gen_pick <- groupedfinal %>% 
+  dplyr::group_by(Population) %>%
+  dplyr::filter(grepl("g__", taxon)) %>%
+  #dplyr::top_n(15, wt=prop) %>%
+  dplyr::arrange(Population, desc(prop)) %>% as.data.frame()
+
+grouped_gen_pick$Country <- gsub(Population ==USA", "Cameroon", groupedmelt_gen_pick)
+
+groupedtest <- gsub("Baka|Bantu|Bagyeli|Mbororo_Fulani", "Cameroon", groupedmelt_gen_pick$Population)
+
+b_pick_col <- c(
+"g__Bifidobacterium" = "#9400D3", 
+"g__Butyricimonas" = "#cb4623", 
+"g__Bacteroides" = "#d60A13",
+"g__Blautia" = "#02e8c1", 
+"g__Coprococcus" = "#b00079", 
+"g__Bacteroides" = "#d60A13",
+"g__Desulfovibrio" = "#e56cd9", 
+"g__Faecalibacterium" = "#a6e57c",
+"g__Dialister" = "#4b4cbf", 
+"g__Dorea" = "#e9c83c", 
+"g__Lachnospira" = "#d0185c", 
+"g__Odoribacter" = "#7deaa1", 
+"g__Roseburia" = "#d0185c",
+"g__Oscillospira" = "#01a876",
+"g__Ruminococcus" = "#ff9a00",
+"g__Roseburia" = "#67a0ff", 
+"g__Parabacteroides" = "#ffae52", 
+"g__Phascolarctobacterium" = "#540040", 
+"g__Clostridium" = "#c3d3fc",
+"g__Veillonella" = "#16a7a3",
+"g__Escherichia" = "#d7d982",
+"g__Succinivibrio" = "#9400D3",
+"g__Prevotella" = "#3E12F3",
+"g__Sutterella" = "#7e0005",
+"g__CF231" = "#a02dfb")
+
+
+#Plot bar chart
+
+groupedmelt_gen_pick %$% 
+  ggplot(data = ., aes(x = Population)) +
+  facet_grid(~ Population, scales = "free", 
+              space = "free") +
+  geom_col(aes(y = prop, fill = variable), width = 2) + #adding in position = "fill" moves bars to full size, no grey
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = " Most Abundant Bacterial Genera per Population", 
+                   values = b_pick_col) +
+    labs(x= "Population", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey")) +
+  theme(legend.position="none")
+
+theme_aa_bars <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Run an ANOVA to test for diffs between groups for bact abundances
+#Calculate ANOVA and TUKEY's posthoc on pop/diversity results
+Anovadf <- groupedmelt_gen_pick %>% unite(PopVar, Population, taxon, sep = "_", remove = TRUE) 
+
+
+res.aov <- aov(prop ~ as.factor(PopVar), data= Anovadf)
+summary (res.aov)
+TukeyHSD(res.aov)
+
+Anovadf <- groupedmelt_gen_pick %>% select(Sampling.Site, value)
+res.aov <- aov(value ~ as.factor(Sampling.Site), data= BantuAnovadf)
+TukeyHSD(res.aov, conf.level = 0.99)
+```
+###Top15 Genera Bantu/Sampling Site
+###=======================================================
+```{r}
+###barplots across Bantu, by sampling site. GENERA
+
+###ASV counts
+counts <- readr::read_delim(feature_table_fp, skip=1, delim="\t") %>%
+  column_to_rownames(var = "#OTU ID") %>%
+  as.matrix()
+
+### taxonomic assignment
+ta <- read_delim(file=taxo_assignment_fp, delim="\t") %>%
+  mutate(trunc_taxon = sub("(; [kpcofgs]__)+$", "", Taxon, perl=T)) %>%
+  arrange(order(match(rownames(counts), `Feature ID`)))
+
+adf <- split_assignments(ta$trunc_taxon) 
+
+###modify metadata 
+CM_US_metadata  <-read.delim("/media/lorax/users/marubel/V4_ANALYSIS/shotgun_metadata_cameroon_42619.csv", sep=",", header=TRUE)
+
+CM_US_metadata$X <- NULL
+
+rownames(CM_US_metadata) <- CM_US_metadata$sampleID
+
+CM_US_metadata <- CM_US_metadata[,-1]
+
+CM_US_metadata_t <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata <- subset(CM_US_metadata_t, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, EB3, EB75, EB47, EB119, LibNeg1, LibNeg2, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4, `cytokine_high20-557`, `cytokine_high564-1293`, cytokine_low20_557, cytokine_low564_1293,D0911, D0523, D0056, D0027, D0071, D0081, D0410, D0785, D0890, D0970, D1193, D1218, D1224, D1250,D1296)) #currently has sampleIDs as columns
+
+CM_US_metadata <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata$Subsistence <- factor(CM_US_metadata$Subsistence, levels= c("Agropastoralist", "Industrial_Agropastoralist", "Hunter-Gatherer", "Pastoralist"))
+CM_US_metadata$Subsistence[367] <- "Pastoralist"
+CM_US_metadata$Subsistence[1:37] <- "Industrial_Agropastoralist"
+CM_US_metadata$Subsistence <- droplevels(CM_US_metadata$Subsistence)
+
+CM_US_metadata$Population <- factor(CM_US_metadata$Population, levels= c("Baka", "Bantu", "Mbororo_Fulani", "Bagyeli", "USA"))
+CM_US_metadata$Population[1:37] <- "USA"
+#CM_US_metadata$Population<- droplevels(CM_US_metadata$Population)
+
+CM_US_metadata$Sampling.Site <- factor(CM_US_metadata$Sampling.Site, levels= c("USA", "Aviation", "Bidou_I", "Bosquet", "Missoume", "Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga"))
+CM_US_metadata$Sampling.Site[1:37]<- "USA"
+#CM_US_metadata$Sampling.Site<- #droplevels(CM_US_metadata$Sampling.Site)
+
+CM_US_metadata$sampleID <- rownames(CM_US_metadata)
+
+Bantuslice <- dplyr::select(CM_US_metadata, Population, Sampling.Site, sampleID) %$% filter(., Population == "Bantu")
+
+eastcities <- list("Bosquet", "Nkolbikong", "Missoume", "Aviation", "Njibot")
+southcities <- list('Bidou_I', 'Ndtoua')
+northwestcities <- list('Ntambang', 'Sabga')
+
+Bantuslice$Sampling.Site <- mgsub(Bantuslice$Sampling.Site, eastcities, "East")
+Bantuslice$Sampling.Site <- mgsub(Bantuslice$Sampling.Site, southcities, "South") 
+Bantuslice$Sampling.Site <- mgsub(Bantuslice$Sampling.Site, northwestcities, "Northwest")
+
+###wokrs up to hear. Now sort counts based on just these samples (get IDS) then plot all Bantu by sampling region (will be three total!)
+
+Bantuslice$sampleID %>% c() -> BantuIDs
+
+dim(CM_US_metadata)
+
+###build counts data frame for barplot
+b <- simplify_assignments(adf, rank1="Genus", rank2 = FALSE)
+names(b) <- ta$`Feature ID`
+
+b <- sub(" +$", "", b) #regex to remove trailing space after taxa
+
+summed_cts <- rowsum(counts, b) 
+summed_cts <-subset(summed_cts, select = c(BantuIDs))
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props2 <- as.data.frame(t(summed_props))
+#summed_props2 <- summed_props[rowSums(summed_props) >0.01,] #filter on rows that are greater than 1% across all samples
+summed_props3 <- dplyr::mutate(summed_props2, Sampling.Site = Bantuslice$Sampling.Site)
+rownames(summed_props3) <- rownames(summed_props2)
+
+grouped <- summed_props3 %>% group_by(Sampling.Site) %>% summarise_all(funs(median)) 
+#grouped <- grouped[1:5,]#always double check this for population #s
+
+#renorm_by_pop <- function(df) {
+ # colidx <- match("Population", colnames(df))
+  #df[, -colidx] <- sweep(df[, -colidx], 1, rowSums(df[, -colidx]), "/")
+#  df
+#}
+#grouped <- renorm_by_pop(grouped)
+
+grouped <- as.data.frame(grouped)
+groupedmelt <- melt(grouped,value.name ="prop", variable.name = "taxon") 
+groupedmelt$prop <- as.character(groupedmelt$prop)
+
+groupedmelt <- as.data.frame(groupedmelt)
+
+#test <- groupedmelt %>% dplyr::filter(grepl("f__", variable))
+
+groupedmelt <- groupedmelt %>% dplyr::filter(!grepl("Unassigned", prop))
+
+groupedmelt$prop <- gsub('g__[Prevotella]', 'g__Prevotella', groupedmelt$prop, fixed = TRUE)
+
+groupedmelt$prop <- gsub('g__[Ruminococcus]', 'g__Ruminococcus', groupedmelt$prop, fixed = TRUE)
+
+groupedmelt$prop <- as.numeric(groupedmelt$prop)
+
+groupedfinal <- groupedmelt %>% dplyr::group_by(Population, taxon) %>%
+  dplyr::summarise(prop = sum(prop)) 
+
+
+pick=15
+
+groupedmelt_gen_pick <- groupedfinal %>% 
+  dplyr::group_by(Population) %>%
+  dplyr::filter(grepl("g__", variable)) %>%
+  dplyr::top_n(15, wt=value) %>%
+  dplyr::arrange(Sampling.Site, desc(value))
+
+
+b_pick_col <- c(
+"g__[Eubacterium]" = "#9a0046", 
+"g__Anaerovibrio" = "#cb4623", 
+"g__Bacteroides" = "#d60A13",
+"g__Blautia" = "#02e8c1", 
+"g__Coprococcus" = "#b00079", 
+"g__Bacteroides" = "#d60A13",
+"g__Desulfovibrio" = "#e56cd9", 
+"g__Faecalibacterium" = "#a6e57c",
+"g__Dialister" = "#4b4cbf", 
+"g__Dorea" = "#e9c83c", 
+"g__Lachnospira" = "#d0185c", 
+"g__Odoribacter" = "#7deaa1", 
+"g__Roseburia" = "#d0185c",
+"g__Oscillospira" = "#01a876",
+"g__Ruminococcus" = "#ff9a00",
+"g__Roseburia" = "#67a0ff", 
+"g__Parabacteroides" = "#ffae52", 
+"g__Phascolarctobacterium" = "#540040", 
+"g__Clostridium" = "#c3d3fc",
+"g__Veillonella" = "#16a7a3",
+"g__Escherichia" = "#d7d982",
+"g__Succinivibrio" = "#9400D3",
+"g__Prevotella" = "#3E12F3",
+"g__Sutterella" = "#7e0005",
+"g__CF231" = "#a02dfb")
+
+
+#Plot bar chart
+
+groupedmelt_gen_pick %$% 
+  ggplot(data = ., aes(x = Sampling.Site)) +
+  facet_grid(~ Sampling.Site, scales = "free", 
+              space = "free") +
+  geom_col(aes(y = value, fill = variable), width = 2, position = "fill") + #adding in position = "fill" moves bars to full size, no grey
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(name = " Most Abundant Bacterial Genera per Population", 
+                   values = b_pick_col) +
+    labs(x= "Sampling.Site", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))
+
+#Run an ANOVA to test for diffs between groups for bact abundances
+#Calculate ANOVA and TUKEY's posthoc on pop/diversity results
+BantuAnovadf <- groupedmelt_gen_pick %>% unite(SampSite_Var, Sampling.Site, variable, sep = "_", remove = TRUE) 
+
+res.aov <- aov(value ~ as.factor(SampSite_Var), data= BantuAnovadf)
+summary (res.aov)
+TukeyHSD(res.aov)
+
+BantuAnovadf <- groupedmelt_gen_pick %>% select(Sampling.Site, value)
+res.aov <- aov(value ~ as.factor(Sampling.Site), data= BantuAnovadf)
+TukeyHSD(res.aov, conf.level = 0.99)
+```
+###Top15 Family Bantu/Sampling Site
+###=======================================================
+```{r}
+###ASV counts
+counts <- readr::read_delim(feature_table_fp, skip=1, delim="\t") %>%
+  column_to_rownames(var = "#OTU ID") %>%
+  as.matrix()
+
+### taxonomic assignment
+ta <- read_delim(file=taxo_assignment_fp, delim="\t") %>%
+  mutate(trunc_taxon = sub("(; [kpcofgs]__)+$", "", Taxon, perl=T)) %>%
+  arrange(order(match(rownames(counts), `Feature ID`)))
+
+adf <- split_assignments(ta$trunc_taxon) 
+
+###modify metadata 
+CM_US_metadata  <-read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/shotgun_metadata_cameroon_4219.csv", sep=",", header=TRUE)
+
+CM_US_metadata$X <- NULL
+
+rownames(CM_US_metadata) <- CM_US_metadata$sampleID
+
+CM_US_metadata <- CM_US_metadata[,-1]
+
+CM_US_metadata_t <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata <- subset(CM_US_metadata_t, select = -c(EB110, EB73, EB1, EB105, EB19, EB56, EB55, EB3, EB75, EB47, EB119, LibNeg1, LibNeg2, PCR1, PCR2, PCR3, PCR4, V4GBlock1, V4GBlock2, V4GBlock3, V4GBlock4, `cytokine_high20-557`, `cytokine_high564-1293`, cytokine_low20_557, cytokine_low564_1293,D0911, D0523, D0056, D0027, D0071, D0081, D0410, D0785, D0890, D0970, D1193, D1218, D1224, D1250,D1296)) #currently has sampleIDs as columns
+
+CM_US_metadata <- as.data.frame(t(CM_US_metadata))
+
+CM_US_metadata$Subsistence <- factor(CM_US_metadata$Subsistence, levels= c("Agropastoralist", "Industrial_Agropastoralist", "Hunter-Gatherer", "Pastoralist"))
+CM_US_metadata$Subsistence[367] <- "Pastoralist"
+CM_US_metadata$Subsistence[1:37] <- "Industrial_Agropastoralist"
+CM_US_metadata$Subsistence <- droplevels(CM_US_metadata$Subsistence)
+
+CM_US_metadata$Population <- factor(CM_US_metadata$Population, levels= c("Baka", "Bantu", "Mbororo_Fulani", "Bagyeli", "USA"))
+CM_US_metadata$Population[1:37] <- "USA"
+#CM_US_metadata$Population<- droplevels(CM_US_metadata$Population)
+
+CM_US_metadata$Sampling.Site <- factor(CM_US_metadata$Sampling.Site, levels= c("USA", "Aviation", "Bidou_I", "Bosquet", "Missoume", "Ndtoua","Njibot","Nkolbikong","Ntambang","Sabga"))
+CM_US_metadata$Sampling.Site[1:37]<- "USA"
+#CM_US_metadata$Sampling.Site<- #droplevels(CM_US_metadata$Sampling.Site)
+
+CM_US_metadata$sampleID <- rownames(CM_US_metadata)
+
+Bantuslice <- dplyr::select(CM_US_metadata, Population, Sampling.Site, sampleID) %$% filter(., Population == "Bantu")
+
+eastcities <- list("Bosquet", "Nkolbikong", "Missoume", "Aviation", "Njibot")
+southcities <- list('Bidou_I', 'Ndtoua')
+northwestcities <- list('Ntambang', 'Sabga')
+
+Bantuslice$Sampling.Site <- mgsub(Bantuslice$Sampling.Site, eastcities, "East")
+Bantuslice$Sampling.Site <- mgsub(Bantuslice$Sampling.Site, southcities, "South") 
+Bantuslice$Sampling.Site <- mgsub(Bantuslice$Sampling.Site, northwestcities, "Northwest")
+
+###wokrs up to hear. Now sort counts based on just these samples (get IDS) then plot all Bantu by sampling region (will be three total!)
+
+Bantuslice$sampleID %>% c() -> BantuIDs
+
+dim(CM_US_metadata)
+
+###build counts data frame for barplot
+b <- simplify_assignments(adf, rank1="Family", rank2 = FALSE)
+names(b) <- ta$`Feature ID`
+
+b <- sub(" +$", "", b) #regex to remove trailing space after taxa
+
+summed_cts <- rowsum(counts, b) 
+summed_cts <-subset(summed_cts, select = c(BantuIDs))
+summed_props <- sweep(summed_cts, 2, colSums(summed_cts), "/")
+
+summed_props2 <- as.data.frame(t(summed_props))
+#summed_props2 <- summed_props[rowSums(summed_props) >0.01,] #filter on rows that are greater than 1% across all samples
+summed_props3 <- dplyr::mutate(summed_props2, Sampling.Site = Bantuslice$Sampling.Site)
+rownames(summed_props3) <- rownames(summed_props2)
+
+grouped <- summed_props3 %>% group_by(Sampling.Site) %>% summarise_all(funs(median)) 
+#grouped <- grouped[1:5,]#always double check this for population #s
+
+#renorm_by_pop <- function(df) {
+ # colidx <- match("Population", colnames(df))
+  #df[, -colidx] <- sweep(df[, -colidx], 1, rowSums(df[, -colidx]), "/")
+#  df
+#}
+#grouped <- renorm_by_pop(grouped)
+
+grouped <- as.data.frame(grouped)
+groupedmelt <- melt(grouped,value.name ="prop", variable.name = "taxon") 
+groupedmelt$variable <- as.character(groupedmelt$variable)
+
+groupedmelt <- as.data.frame(groupedmelt)
+
+#test <- groupedmelt %>% dplyr::filter(grepl("f__", variable))
+
+groupedmelt <- groupedmelt %>% dplyr::filter(!grepl("Unassigned", variable))
+
+groupedmelt$variable <- gsub('g__[Prevotella]', 'g__Prevotella', groupedmelt$variable, fixed = TRUE)
+
+groupedmelt$variable <- gsub('g__[Ruminococcus]', 'g__Ruminococcus', groupedmelt$variable, fixed = TRUE)
+  
+groupedfinal <- groupedmelt %>% dplyr::group_by(Population, variable) %>%
+  dplyr::summarise(value = sum(prop)) 
+
+
+pick=15
+
+groupedmelt_gen_pick <- groupedfinal %>% 
+  dplyr::group_by(Sampling.Site) %>%
+  dplyr::filter(grepl("f__", variable)) %>%
+  dplyr::top_n(20, wt=value) %>%
+  dplyr::arrange(Sampling.Site, desc(value))
+
+b_pick_col <- c(
+  "f__Alcaligenaceae" = "#9a0046", 
+  "f__Bacteroidaceae" = "#d60A13",
+  "f__[Mogibacteriaceae]" = "#9400D3", 
+  "f__Christensenellaceae" = "#9400D3", 
+  "f__Clostridiaceae" = "#a6e57c",
+  "f__Coriobacteriaceae" = "#02e8c1", 
+  "f__Desulfovibrionaceae" = "#3b085f",
+  "f__Enterobacteriaceae" = "#d7d982",
+  "f__Erysipelotrichaceae" = "#e56cd9",
+  "f__Lachnospiraceae" = "#d0185c",
+  "f__[Odoribacteraceae]" = "#cb4623",
+  "f__[Paraprevotellaceae]" = "#3b085f", 
+  "f__Pasteurellaceae" = "#4b4cbf",
+  "f__Porphyromonadaceae" = "#7deaa1",
+  "f__Prevotellaceae" = "#3E12F3",
+  "f__Rikenellaceae" = "#b00079",
+  "f__Ruminococcaceae" = "#ff9a00", 
+  "f__Peptostretococcaceae" = "#67a0ff", 
+  "f__S24-7" = "#a10e0b", 
+  "f__Victivallaceae" = "#a02dfb",
+  "f__Streptococcaceae"= "#7e0005", 
+  "f__Succinivibrionaceae" ="#be1539",
+  "f__Methanobacteriaceae" = "#184019",  
+  "f__Veillonellaceae" = "#ff95a3")
+
+#Plot bar chart
+
+groupedmelt_gen_pick %$% 
+  ggplot(data = ., aes(x = Sampling.Site)) +
+  facet_grid(~ Sampling.Site, scales = "free", 
+              space = "free") +
+  geom_col(aes(y = value, fill = variable), width = 2, position = "fill") + #adding in position = "fill" moves bars to full size, no grey
+  scale_y_continuous(expand = c(0,0), limits = c(0,1)) +
+ scale_fill_manual(name = " Most Abundant Bacterial Genera per Population", 
+                  values = b_pick_col) +
+    labs(x= "Sampling.Site", 
+       y="Relative Abundance") + 
+  theme_aa_bars +
+  theme(legend.text=element_text(size=rel(1.25)),
+        axis.text = element_text(size=rel(1.25)),
+        axis.title = element_text(size=rel(1.25)),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "grey"))
+
+#Run an ANOVA to test for diffs between groups for bact abundances
+#Calculate ANOVA and TUKEY's posthoc on pop/diversity results
+BantuAnovadf <- groupedmelt_gen_pick %>% unite(SampSite_Var, Sampling.Site, variable, sep = "_", remove = TRUE) 
+
+res.aov <- aov(value ~ as.factor(SampSite_Var), data= BantuAnovadf)
+summary (res.aov)
+TukeyHSD(res.aov)
+
+BantuAnovadf <- groupedmelt_gen_pick %>% select(Sampling.Site, value)
+res.aov <- aov(value ~ as.factor(Sampling.Site), data= BantuAnovadf)
+TukeyHSD(res.aov, conf.level = 0.99)
+```
+
+###Upset Plots
+###===============
+```{r}
+library(ggupset)
+library(reshape2)
+library(readr)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+new_11 <- read_delim("new 11.txt", "\t", 
+    escape_double = FALSE, trim_ws = TRUE)
+View(new_11)
+
+new_11 %>% dplyr::group_by(Category) %>% table()
+
+new_11$freq <- c('1')
+
+new_11_2 <- as.data.frame(new_11)
+new_11m <- melt(new_11)
+
+new_11md <- dcast(new11_m, Taxa~Category)
+
+rownames(new_11md) <- new_11md$Taxa
+new_11md <- new_11md[,-1]
+
+upsestcategories <- upset(new_11md, nsets = 12, matrix.color= 'blue', sets.bar.color=c(maroon', 'blue', 'orange'))
+```
+###Modifications to S_stercoralis metadata
+###==========================================
+```{r}
+
+metadata_fp <- file.path("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/shotgun_metadata_cameroon_4219.csv")
+metadata <- read.table(metadata_fp, sep=",", header=T, row.names=1, stringsAsFactors=FALSE, comment.char="")
+
+metadata_IDs_filtered =  t(metadata)
+
+#View(metadata_IDs_filtered)
+colnames(metadata_IDs_filtered) = metadata_IDs_filtered[1, ] #duplicates top row as header
+
+#View(metadata_IDs_filtered)
+metadata_IDs_filtered = as.data.frame(metadata_IDs_filtered[-1, ]) #removes top row as header
+
+IDdrops <- c("3001","3003","3006","3007","3008","3009","3010","3011","3013","3015","3018","3019","3020","3023","3025","3032","3034","3037","3038","3041","3044","3045","3046","3047","3049","3050","3052","3053","3056","3057","3064","3067","3068","3076","3078","3080","3083","EB105","EB110","EB73","PCR4","V4GBlock4","EB56","PCR3","V4GBlock3","EB1","EB19","PCR1","V4GBlock1","EB55","PCR2","V4GBlock2","cytokine_high20-557","cytokine_high564-1293","cytokine_low20_557","cytokine_low564_1293","EB119","EB3","EB47","EB75","LibNeg1","LibNeg2")     
+
+metadata_IDs_filtered <- metadata_IDs_filtered[,!colnames(metadata_IDs_filtered) %in% IDdrops] 
+
+metadata_IDs_filtered = as.data.frame(t(metadata_IDs_filtered))
+
+metadata_IDs_filtered['D0463','S_stercoralis'] <- c('Positive')
+metadata_IDs_filtered['D0564','S_stercoralis']
+metadata_IDs_filtered['D0564','S_stercoralis'] <- c('Positive')
+metadata_IDs_filtered['D0611','S_stercoralis'] <- c('Positive')
+metadata_IDs_filtered['D0623','S_stercoralis'] <- c('Positive')
+metadata_IDs_filtered['D0645','S_stercoralis'] <- c('Positive')
+```
+###Cooccurence analysis for parasites
+###==================================
+```{r cooccurence_analysis, echo=FALSE}
+library(cooccur)
+
+BloodFecalHIV_Binary <- read.delim("/media/lorax/users/marubel/V4_ANALYSIS/EXPORTED-FEATURE-TABLE/BloodFecalHIV_Binary.txt")
+BloodFecalHIV_Binary[2,2:508] <- 0 #updated ancylo = 0 from 4-2-19
+
+BloodFecalHIV_Binary2 <- BloodFecalHIV_Binary[,-1]
+rownames(BloodFecalHIV_Binary2) <- BloodFecalHIV_Binary[,1]
+#Produce output object of class cooccur containing all the results from the cooccurence analysis. Can take presence/absence or abundance data
+cooccur_BloodFecalHIV_Binary2 <- cooccur(BloodFecalHIV_Binary2, type = "spp_site", thresh = TRUE, spp_names = TRUE, prob = "hyper")
+
+#Insepct pairwise results for significant species combinations across all pairs analyzed
+prob.table(cooccur_BloodFecalHIV_Binary2)
+
+#Inspect effect sizes for significant species combinations across all pairs analyzed
+effect.sizes(cooccur_BloodFecalHIV_Binary2)
+
+#Visualization of all pairwise combinations of species and their co-occurrence signs (positive or negative) using a ggplot2 heatmap. The polot trims out species that dont'n have any sig. neg or positive assc. and orders the remaining species starting from those with the most negative interactions to those with the most positive interactions, left to right. 
+plot(cooccur_BloodFecalHIV_Binary2) 
+
+#Calculates effect sizes from the co-ccurrence analyses; allows for comparisons among studies and methods; provides a quantitative measurement of co-occurrence for use in downstream analyses. Effect sizes are differences between expected and observed frequency of co-occurrence. Values can be standaridized by dividing these differences by the number of sampling sites in the data set. In standardized form, these values are bounded from -1 to 1, pos values indicate pos asscns, neg indicate negative asscns
+cooccur_BloodFecalHIV_Binary2_effectsz <- cooccur(BloodFecalHIV_Binary2, type = "spp_site", thresh = TRUE, spp_names = TRUE, only_effects = TRUE, eff_standard = TRUE, eff_matrix = TRUE) 
+
+#Observe the degree to which species pairs deviate from their expected co-occurrence levels, plot observed values against expected values as a visual diagnostic. 
+obvexpplot <- obs.v.exp(cooccur_BloodFecalHIV_Binary2) + theme_bw()
+
+```
+###Differential Abundance using EdgeR
+###==================================
+```{r}
+library(edgeR)
+library(phyloseq)
+
+################################################################################
+#' Convert phyloseq OTU count data into DGEList for edgeR package
+#' 
+#' Further details.
+#' 
+#' @param physeq (Required).  A \code{\link{phyloseq-class}} or
+#'  an \code{\link{otu_table-class}} object. 
+#'  The latter is only appropriate if \code{group} argument is also a 
+#'  vector or factor with length equal to \code{nsamples(physeq)}.
+#'  
+#' @param group (Required). A character vector or factor giving the experimental
+#'  group/condition for each sample/library. Alternatively, you may provide
+#'  the name of a sample variable. This name should be among the output of
+#'  \code{sample_variables(physeq)}, in which case
+#'  \code{get_variable(physeq, group)} would return either a character vector or factor.
+#'  This is passed on to \code{\link[edgeR]{DGEList}},
+#'  and you may find further details or examples in its documentation.
+#'  
+#' @param method (Optional). The label of the edgeR-implemented normalization to use.
+#'  See \code{\link[edgeR]{calcNormFactors}} for supported options and details. 
+#'  The default option is \code{"RLE"}, which is a scaling factor method 
+#'  proposed by Anders and Huber (2010).
+#'  At time of writing, the \link[edgeR]{edgeR} package supported 
+#'  the following options to the \code{method} argument:
+#'  
+#'  \code{c("TMM", "RLE", "upperquartile", "none")}.
+#'
+#' @param ... Additional arguments passed on to \code{\link[edgeR]{DGEList}}
+#' 
+#' @examples
+#' 
+phyloseq_to_edgeR = function(physeq, group, method="RLE", ...){
+  require("edgeR")
+  require("phyloseq")
+  # Enforce orientation.
+  if( !taxa_are_rows(physeq) ){ physeq <- t(physeq) }
+  x = as(otu_table(physeq), "matrix")
+  # Add one to protect against overflow, log(0) issues.
+  x = x + 1
+  # Check `group` argument
+  if( identical(all.equal(length(group), 1), TRUE) & nsamples(physeq) > 1 ){
+    # Assume that group was a sample variable name (must be categorical)
+    group = get_variable(physeq, group)
+  }
+  # Define gene annotations (`genes`) as tax_table
+  taxonomy = tax_table(physeq, errorIfNULL=FALSE)
+  if( !is.null(taxonomy) ){
+    taxonomy = data.frame(as(taxonomy, "matrix"))
+  } 
+  # Now turn into a DGEList
+  y = DGEList(counts=x, group=group, genes=taxonomy, remove.zeros = TRUE, ...)
+  # Calculate the normalization factors
+  z = calcNormFactors(y, method=method)
+  # Check for division by zero inside `calcNormFactors`
+  if( !all(is.finite(z$samples$norm.factors)) ){
+    stop("Something wrong with edgeR::calcNormFactors on this data,
+         non-finite $norm.factors, consider changing `method` argument")
+  }
+  # Estimate dispersions
+  return(estimateTagwiseDisp(estimateCommonDisp(z)))
+}
+################################################################################Using dge (edgeR) calculation sig different taxa 
+library(edgeR)
+
+#Bantu subset
+Banturegion_subset <- subset_samples(physeq1, Bantu_region%in%c("Bantu_NW","Bantu_E","Bantu_S"))
+
+Banturegion_subset_p = transform_sample_counts(Banturegion_subset, function(x){x/sum(x)})
+hist(log10(apply(otu_table(Banturegion_subset_p), 1, var)),
+     xlab="log10(variance)", breaks=50,
+     main="A large fraction of OTUs have very low variance")
+
+varianceThreshold = 1e-6
+keepOTUs = names(which(apply(otu_table(Banturegion_subset_p), 1, var) > varianceThreshold))
+Banturegion_subset = prune_taxa(keepOTUs, Banturegion_subset)
+
+keepOTUs = names(which(apply(otu_table(Banturegion_subset_p), 1, var) > varianceThreshold))
+Banturegion_subset1 = prune_taxa(keepOTUs, Banturegion_subset)
+
+Banturegion_subset
+
+
+dge = phyloseq_to_edgeR(Banturegion_subset, group = "Bantu_region")
+# Perform binary test
+et_EvsNW = exactTest(dge, pair = 1:2)
+#et_SvNW = exactTest(dge, pair = 2:3)
+#et_SvsE = exactTest(dge, pair = c("Bantu_E", "Bantu_S"))
+
+# Extract values from test results
+tt = topTags(et_SvsE , n=nrow(dge$table), adjust.method="BH", sort.by="PValue")
+
+res = tt@.Data[[1]]
+alpha = 0.001
+sigtab = res[(res$FDR < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(Banturegion_subset)[rownames(sigtab), ], "matrix"))
+dim(sigtab)
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+sigtabgen = subset(sigtab, !is.na(Genus))
+# Phylum order
+x = tapply(sigtabgen$logFC, sigtabgen$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Phylum = factor(as.character(sigtabgen$Phylum), levels = names(x))
+# Genus order
+x = tapply(sigtabgen$logFC, sigtabgen$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Genus = factor(as.character(sigtabgen$Genus), levels = names(x))
+
+Bantu_SvsE <- ggplot(sigtabgen, aes(x = Genus, y = logFC, color = Phylum)) + geom_point(size=6) + theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5)) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+#Lactose Subset
+Lactose_subset <- subset_samples(physeq1, Lactose_Binary%in%c("LNP","LP"))
+
+Lactose_subset_p = transform_sample_counts(Lactose_subset, function(x){x/sum(x)})
+hist(log10(apply(otu_table(Lactose_subset_p), 1, var)),
+     xlab="log10(variance)", breaks=50,
+     main="A large fraction of OTUs have very low variance")
+
+varianceThreshold = 1e-6
+keepOTUs = names(which(apply(otu_table(Lactose_subset_p), 1, var) > varianceThreshold))
+Lactose_subset1 = prune_taxa(keepOTUs, Lactose_subset)
+
+Lactose_subset1
+
+
+dge = phyloseq_to_edgeR(Lactose_subset1, group = "Lactose_Binary")
+# Perform binary test
+et = exactTest(dge)
+# Extract values from test results
+tt = topTags(et, n=nrow(dge$table), adjust.method="BH", sort.by="PValue")
+res = tt@.Data[[1]]
+alpha = 0.001
+sigtab = res[(res$FDR < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(Lactose_subset1)[rownames(sigtab), ], "matrix"))
+dim(sigtab)
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+sigtabgen = subset(sigtab, !is.na(Genus))
+# Phylum order
+x = tapply(sigtabgen$logFC, sigtabgen$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Phylum = factor(as.character(sigtabgen$Phylum), levels = names(x))
+# Genus order
+x = tapply(sigtabgen$logFC, sigtabgen$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Genus = factor(as.character(sigtabgen$Genus), levels = names(x))
+ggplot(sigtabgen, aes(x = Genus, y = logFC, color = Phylum)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+
+###Subsistence
+Subs_subset <- subset_samples(physeq1, Subsistence%in%c("Agropastoralist",
+                                                           "Pastoralist", "Hunter-Gatherer"))
+
+Subs_subset_p = transform_sample_counts(Subs_subset, function(x){x/sum(x)})
+hist(log10(apply(otu_table(Subs_subset_p), 1, var)),
+     xlab="log10(variance)", breaks=50,
+     main="A large fraction of OTUs have very low variance")
+
+varianceThreshold = 1e-6
+keepOTUs = names(which(apply(otu_table(Subs_subset_p), 1, var) > varianceThreshold))
+Subs_subset_p1 = prune_taxa(keepOTUs, Subs_subset)
+
+Subs_subset_p1
+
+
+dge = phyloseq_to_edgeR(Subs_subset_p1, group = "Subsistence")
+# Perform binary test
+et = exactTest(dge)
+# Extract values from test results
+tt = topTags(et, n=nrow(dge$table), adjust.method="BH", sort.by="PValue")
+res = tt@.Data[[1]]
+alpha = 0.001
+sigtab = res[(res$FDR < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(Subs_subset_p1)[rownames(sigtab), ], "matrix"))
+dim(sigtab)
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+sigtabgen = subset(sigtab, !is.na(Genus))
+# Phylum order
+x = tapply(sigtabgen$logFC, sigtabgen$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Phylum = factor(as.character(sigtabgen$Phylum), levels = names(x))
+# Genus order
+x = tapply(sigtabgen$logFC, sigtabgen$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Genus = factor(as.character(sigtabgen$Genus), levels = names(x))
+ggplot(sigtabgen, aes(x = Genus, y = logFC, color = Phylum)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+
+###Bantu ANTS positive
+BA_subset <- subset_samples(physeq1, Bantu_ANTS%in%c("No",
+                                                           "Yes"))
+
+BA_subset_p = transform_sample_counts(BA_subset, function(x){x/sum(x)})
+hist(log10(apply(otu_table(BA_subset_p), 1, var)),
+     xlab="log10(variance)", breaks=50,
+     main="A large fraction of OTUs have very low variance")
+
+varianceThreshold = 1e-6
+keepOTUs = names(which(apply(otu_table(BA_subset_p), 1, var) > varianceThreshold))
+BA_subset_p1 = prune_taxa(keepOTUs, BA_subset)
+
+BA_subset_p1
+
+
+dge = phyloseq_to_edgeR(BA_subset_p1, group = "Bantu_ANTS")
+# Perform binary test
+et = exactTest(dge)
+# Extract values from test results
+tt = topTags(et, n=nrow(dge$table), adjust.method="BH", sort.by="PValue")
+res = tt@.Data[[1]]
+alpha = 0.001
+sigtab = res[(res$FDR < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(BA_subset_p1)[rownames(sigtab), ], "matrix"))
+dim(sigtab)
+
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+sigtabgen = subset(sigtab, !is.na(Genus))
+# Phylum order
+x = tapply(sigtabgen$logFC, sigtabgen$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Phylum = factor(as.character(sigtabgen$Phylum), levels = names(x))
+# Genus order
+x = tapply(sigtabgen$logFC, sigtabgen$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabgen$Genus = factor(as.character(sigtabgen$Genus), levels = names(x))
+ggplot(sigtabgen, aes(x = Genus, y = logFC, color = Phylum)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust = 0.5))
+```
+Lactose Phenotypes with GM
+```{r}
+BA_Porphy <- ggplot(data = abundance_scaled_poscntrl, aes(x = IL.5, y = X....................Porphyromonas.asaccharolytica)) + 
+  #geom_boxplot()+
+  geom_point(position = position_jitter(width = 0.25), na.rm = TRUE) +
+  #facet_grid(. ~ Nematode) +
+  geom_point(aes(color = factor(IL.5))) +
+ scale_x_continuous(breaks = c(1, 15, 30, 45, 60, 75)) +
+  #ylim(0,4.5) +
+  geom_smooth(method = lm) +
+  geom_point(color='#453781FF')  +
+  labs(title = 'Normalized Abundances of RFC taxa and IL5',y= 'Porphyromonas asaccharolytica', x =   'IL.5') +
+  theme_bw()
+
+idmaker <- function(x)
+  {
+    max.val = x*100
+    count <- nchar(as.character(max.val))                      
+    size <- paste("%0",count,"d",sep="")                       
+    lets <- toupper(sample(letters,x, replace=T))             
+    nums <- sprintf(size,sample(1:max.val)[1])               
+  return(ids)
+  }

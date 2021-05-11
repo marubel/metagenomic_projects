@@ -1,0 +1,1154 @@
+```{r setup, echo=FALSE}
+#Creates figure image files in Knit folder 
+library(knitr)
+opts_chunk$set(
+  tidy=FALSE,
+  cache=F,
+  echo=F,
+  dpi=100,
+  fig.width=6,
+  fig.path="Knit/figure/",
+  cache.path="Knit/cache/",
+  dev=c("png", "pdf", "postscript"))
+```
+
+```{r load_scripts, echo=FALSE, message=FALSE, warning=FALSE}
+#Load scripts for 16S analysis
+library(qiimer)
+library(pander)
+library(kylemisc)
+library(fossil)
+library(plyr)
+library(dplyr)
+library(gdata)
+library(ggplot2)
+library(ggrepel)
+library(picante)
+library(tidyr)
+library(eclectic)
+library(indicspecies)
+```
+
+```{r load_custom, echo=FALSE, message=FALSE, warning=FALSE}
+source(file="../test_OTU_abundance.R")
+source(file="../test_taxon_abundance.R")
+source(file="../1_way_pcoa.R")
+source(file="../rarefaction_diversity.R")
+```
+
+```{r 90_percent_assignment_OTU_method, echo=FALSE}
+# Assign sample mapping file
+s <- read_qiime_mapping_file("tishkoff_microbiome_v8.txt")
+#s <- read_qiime_mapping_file("tishkoff_microbiome_v4.txt")
+#s <- read_qiime_mapping_file("tishkoff_microbiome.v3.mapping_keepers.txt")
+
+# Assign OTU table
+o <- read_qiime_otu_table("swarm_otu_defaults_filtered/classic_otu_table_nosingdoub.txt")
+
+# Metadata in the form of truncated green genes assignments
+md <- sub("(; [kpcofgs]__)+$", "", o$metadata, perl=T)
+
+# Assignments data-frame
+adf <- split_assignments(md)
+a <- simplify_assignments(adf)
+
+# Check for invalid sample IDs
+problem_ids <- setdiff(s$SampleID, colnames(o$counts))
+if (length(problem_ids ) > 0) stop (simpleError(paste("id mismatch found", problem_ids, collapse=" ")))
+```
+
+```{r}
+# Assignment counts per SampleID
+removed_cts <- o$counts[,s$SampleID]
+s$read_counts <- colSums(removed_cts)
+rm(o)
+```
+
+```{r}
+#tree <- read.tree(file = "swarm_otu_defaults_filtered/rep_set.tre")
+wtu <- read_qiime_distmat("beta_diversity_filtered_no_singdoub/weighted_normalized_unifrac_dm.txt")
+unw <- read_qiime_distmat("beta_diversity_filtered_no_singdoub/unweighted_unifrac_dm.txt")
+```
+
+```{r}
+s$lacgroup <- "no information"
+s[s$Lactose_Binary == "Y" & s$LCT_SNP_Present == "Y",]$lacgroup = "posboth"
+s[s$Lactose_Binary == "N" & s$LCT_SNP_Present == "N",]$lacgroup = "negboth"
+s[s$Lactose_Binary == "Y" & s$LCT_SNP_Present == "N",]$lacgroup = "LPpos"
+s[s$Lactose_Binary == "N" & s$LCT_SNP_Present == "Y",]$lacgroup = "LCTpos"
+s$lacgroup <- as.factor(s$lacgroup)
+```
+
+```{r}
+#s$Super_Ethnicity <- factor(s$Super_Ethnicity, levels=c("Philadelphian" ,
+#                                                       "Burunge",
+#                                                       "Sandawe", 
+#                                                       "Niger_Kordofanian",
+#                                                       "Herero",
+#                                                       "Masaai",
+#                                                       "Khoisan",
+#                                                       "Hadzabe",
+#                                                       "Khoisan_NigerKordofanianMixed"
+#                                                       ))
+
+s <- arrange(s, Country, Subsistence, Super_Ethnicity)
+s$geographicBin<- as.factor(s$geographicBin)
+
+s_no_phila <- subset(s, ! Country %in% "US")
+#s_no_mixed <- subset(s, ! Super_Ethnicity %in% "Khoisan_NigerKordofanianMixed")
+s_bots <- subset(s, Country %in% "Botswana")
+s_tan <- subset(s, Country %in% "Tanzania")
+
+s_handm <- subset(s, Super_Ethnicity %in% "Herero" | Super_Ethnicity %in% "Masaai")
+#s$geographicBin <- paste(s$Dx, as.character(s$Timepoint), sep="-")
+```
+
+```{r}
+theme_set(theme_classic() + theme(
+axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid')))
+```
+
+# Begin analysis ------
+
+
+```{r echo=FALSE, warning=FALSE}
+mapping_subset <- s
+
+props <- sweep(removed_cts, 2, colSums(removed_cts), `/`)
+otu.melt <- melt(props, varnames=c("otu", "SampleID"))
+otu.melt.joined1 <- inner_join(otu.melt, mapping_subset, by="SampleID")
+otu.melt.joined1_sub <- otu.melt.joined1 %>% rename("freq"=value, "PostPCRConc"=X16sRNAAmplibraryspec_ngperul)
+
+contam_otus <- contam_test(otu.melt.joined1_sub)
+contam_otuids <- droplevels(unique(subset(contam_otus, p.value < 0.01)$otu))
+
+removed_cts <- removed_cts[-(which(rownames(removed_cts) %in% contam_otuids)),]
+removed_a <- a[rownames(removed_cts)]
+```
+
+```{r}
+transposed_cts <- t(removed_cts)
+```
+
+```{r echo=FALSE}
+#Not actually Faiths PD - is actually probbaly shannon - implement simpson
+#tree <- drop.tip(tree, rownames(removed_cts))
+#rooted_tree <- root(tree, sample(rownames(removed_cts), 1), resolve.root = TRUE)
+#pd <- pd(removed_cts, rooted_tree, include.root = TRUE)
+
+s$shannon <- diversity(transposed_cts[s$SampleID,], index = "shannon", MARGIN = 1, base = exp(1))
+#s_no_mixed$shannon <- shannon[s_no_mixed$SampleID]
+
+s$simpson <- diversity(transposed_cts[s$SampleID], index = "simpson", MARGIN = 1, base = exp(1))
+#s_no_mixed$shannon <- shannon[s_no_mixed$SampleID]
+
+# from fossil library, use chao1
+#s_no_mixed$chao1 <- apply(removed_cts[s_no_mixed$SampleID], 2, chao1)
+```
+
+```{r alpha_diversity_rarefaction_Super_ethnicity, echo=FALSE}
+rarefaction_diversity(removed_cts, s, var="Super_Ethnicity", rarefaction_depth = 5000, do_test=FALSE)
+
+>mydata<-read.csv("mydata.csv")
+>comm1<-rankabundance(mydata)
+>rankabunplot(comm1, scale="proportion", pch=16)
+
+x <- comm1[,1]
+y <- comm1[,2]/colSums(comm1)[2]
+plot(x, y, log="y", type="o", pch=16, xlab="Species rank", ylab="Proportion")
+```
+
+```{r shannon, echo=FALSE}
+ggplot(s) +
+  geom_boxplot(aes(x=Country, y=shannon))+
+  xlab("Ethnicity") +
+  ylab("Shannon Index") +
+  #ggtitle("Rarefied to 10,000 OTU observation per sample") +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle = -45, hjust = 0))
+  
+```
+
+```{r simpson, echo=FALSE}
+# ggplot(s_no_mixed) +
+#   geom_boxplot(aes(x=Super_Ethnicity, y=simpson))+
+#   xlab("Ethnicity") +
+#   ylab("Simpson Diversity Index") +
+#   #ggtitle("Phylogenetic Diversity") +
+#   theme_classic() +
+#   theme(axis.text.x=element_text(angle = -45, hjust = 0))
+```
+
+
+```{r chao2}
+# NB: swarm makes much smaller clusters than uclust, therefore we see a lot more "species" the 97% similarity line doesn't really mean the same thing either. This may factually be more accurate.
+# ggplot(s_no_mixed, echo=FALSE) +
+#   geom_boxplot(aes(x=Super_Ethnicity, y=chao1))+
+#   xlab("Ethnicity") +
+#   ylab("Estimated number of OTUs") +
+#   ggtitle("Chao1 Estimator") +
+#   theme_classic()+ 
+#   theme(axis.text.x=element_text(angle = -45, hjust = 0))
+```
+
+
+#### Taxa are grouped by lowest common ranks for each OTU. Ranks are included in the plot if the combined OTUs reach 1000 observations together.
+```{r overall_heatmap_annotations, echo=FALSE}
+annotations <- s[,c( "Country", "Super_Ethnicity", "Subsistence", "X16sRNAAmplibraryspec_ngperul")]
+#ann_colors <- list( study_group=c( "Neomycin"="red", "No Abx"="blue" ))
+rownames(annotations) <- s$SampleID
+```
+
+```{r superfilteredOTU_Heatmap, fig.width=26, fig.height=15, echo=FALSE}
+otu_heatmap(
+  removed_cts, 
+  removed_a,
+  annotation=annotations,
+  threshold=1000, 
+  color = saturated_rainbow(100, saturation_limit = 0.4), 
+  cluster_cols = FALSE, cluster_rows = FALSE,
+  fontsize_col = 10, fontsize_row = 12, 
+  cellwidth=10, cellheight=12, 
+  legend = TRUE,
+  file="super_filtered_swarm_otu_heatmap.pdf"
+  )
+```
+
+
+### Stacked barcharts by Family
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+Rank <- "Family"
+mapping_subset <- s
+metadata_col <- "PopCode"
+ 
+ 
+otu.melt <- melt(removed_cts, varnames=c("otu", "SampleID"))
+otu.melt.joined1 <- inner_join(otu.melt, mapping_subset, by="SampleID")
+otu.cast <- dcast(otu.melt.joined1, paste("otu ~", metadata_col), value.var="value", fun.aggregate=sum)
+otu.melt.again <- melt(otu.cast)
+otu.melt.joined2 <- merge(otu.melt.again, adf, by.x = "otu", by.y = "row.names")
+otu.mj2 <- tbl_df(otu.melt.joined2)
+otu.mj3 <- otu.mj2 %>% group_by(variable)  %>% mutate(prop=value/sum(value))
+rank2<- c("variable", Rank)
+
+otu.mj4 <- otu.mj3 %>% group_by_(.dots=rank2) %>% summarize(prop=sum(prop))%>% filter(prop > 0.01)%>% mutate(prop=prop/sum(prop))
+
+otu.mj4 <- arrange(otu.mj4, desc(Family, prop))
+otu.mj4$Family <- sub("f__","",otu.mj4$Family)
+otu.mj4$Family[is.na(otu.mj4$Family)] <- "Unassigned"
+#otu.mj4 <- arrange_(.data=otu.mj4, desc(Phylum, prop))
+```
+
+
+```{r Stacked_barchart_family_filtered, fig.height=9}
+
+# otu.mj4$variable <- factor(otu.mj4$variable, levels=c("PCR WATER",
+#                                                       "Unopened Swab",
+#                                                       "Air Swab of OR",
+#                                                       "Extraction Blank",
+#                                                       "Fetal Side Placenta",
+#                                                       "Maternal Side Placenta",
+#                                                       "Saliva"))
+
+
+ggplot(data=otu.mj4, aes_string(x="variable", y="prop", fill=Rank, group=Rank )) +
+  geom_bar(stat="identity") +scale_fill_manual(values=c("#a3b36b","#c452bb","#56b854","#7463cd","#a3b437","#ca8dcf","#d69b39","#5d8bcb","#d35238","#50c1b1","#d35676","#408a57","#994b7d","#71752a","gray","#b77448")) +
+  ylab("Proportion of total OTU counts") +
+  ggtitle(paste("PopCode by Bacterial", Rank)) + theme_classic()  + 
+ theme(axis.text.x=element_text(angle = -90, hjust = 0),axis.title.x = element_blank(),legend.key.size =unit (0.3, "cm"), legend.key.width=unit(0.3,"cm"),legend.key.height=unit(0.3,"cm"))+
+  guides(fill=guide_legend(ncol=1,bycol=TRUE))
+```
+### botswana only
+
+```{r}
+test_taxon_abundance(s_bots, removed_cts, "Super_Ethnicity", a=removed_a, min_fraction = .8 )
+```
+
+### tanzania only
+```{r fig.height=11}
+test_otu_abundance(s_tan, removed_cts, "Super_Ethnicity", a=removed_a , min_fraction = .9)
+```
+
+### Herero and Maasai only
+```{r fig.height=11}
+test_taxon_abundance(s_handm, removed_cts, "Super_Ethnicity", a=removed_a )
+```
+
+
+# what taxa are highly prognostic of subsistence or ethnicity
+### random forest to see if we -can- pick out a subsistence style (for each country and within) from microbial data
+
+#supervised_learning.py -i rarefied_tables/ -m mapping_v4.txt -c Super_Ethnicity -o sl_rarefied_tables_loo -e loo
+
+
+
+
+
+
+
+
+
+
+
+
+```{r echo=TRUE}
+### Which OTU is the Clostridiales in our extraction method
+head(sort(rowSums(removed_cts[removed_a=="p__Bacteroidetes g__Prevotella",]),decreasing = TRUE), n=5)
+### manual lookup using linux 
+#### grep -A1 "denovo120 " swarm_otu/rep_set/seqs_rep_set.fasta
+#### grep -A1 "denovo123 " swarm_otu/rep_set/seqs_rep_set.fasta
+```
+
+```{r}
+cts_sum <- rowsum(removed_cts[,s$SampleID], as.character(removed_a))
+
+s$Entero <- cts_sum["p__Firmicutes g__Enterococcus",]
+```
+
+
+#For the lac stuff
+#The only thing we need to check is if it's statistically viable
+#Are there enough Hadza who didn't have the Lactose digesting phenotype/LCT variant negative in other groups to balance out our finding?
+# i.e. Enough Hadza in other groups that we can say that our correlation with treponema is significant to this LP+/LCT- group while controlling for sampling bias - I have all the other data
+
+## lactose test Only
+```{r}
+s_lac <- droplevels(subset(s, !lacgroup %in% "no information"))
+mapping_subset <- s_lac
+metadata_col <- c("lacgroup", NULL) #second argument may be used as strata
+```
+
+```{r}
+table( s_lac$Super_Ethnicity, s_lac$lacgroup) 
+table(s_lac$Super_Ethnicity)
+
+```
+
+# can fisher.test( this)
+
+# glm for trep vs F/T
+
+
+### Presence/Absence Unifrac plots, colored by `r metadata_col`
+
+```{r unw_pcoa_lac}
+unw_pcoa <- pcoa_1way(mapping_subset, unw, var=metadata_col[1], strata=metadata_col[2])
+unw_pcoa$plot + geom_point(size=4)  + ggtitle("Unweighted Unifrac")+ theme(
+axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'))
+
+```
+
+#### Presence/Absence test for effect (group centroids), by `r metadata_col`
+
+```{r }
+udf <- droplevels(unw_pcoa$df)
+adonis(as.formula(paste("unw_pcoa$distances ~", paste(metadata_col,collapse="+"))), data=udf)
+```
+
+### Abundance weighted Unifrac plots, colored by `r metadata_col`
+
+```{r wtu_pcoa_lac}
+wtu_pcoa <- pcoa_1way(mapping_subset, wtu, var=metadata_col, strata=metadata_col[2])
+wtu_pcoa$plot + geom_point(size=4) + ggtitle("Weighted Unifrac") + theme(
+axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'))
+```
+
+### Weighted test for effect (group centroids), by `r metadata_col`
+
+```{r}
+wdf <- droplevels(wtu_pcoa$df)
+adonis(as.formula(paste("wtu_pcoa$distances ~", paste(metadata_col,collapse="+"))), data=wdf)
+```
+
+# lactose tests
+### kruskal wallis test of all subjects for which we have lactose data using lactose binary as pass/fail
+```{r KW_lac, fig.height=6}
+test_otu_abundance(s_lac, removed_cts, "Lactose_Binary", a=removed_a )
+```
+
+### hadza only test of lactose binary
+```{r}
+s_had_lac_only <- subset(s_lac, Super_Ethnicity %in% "Hadzabe")
+test_taxon_abundance(s_had_lac_only, removed_cts, "Lactose_Binary", a=removed_a)
+```
+
+
+# best plot evar
+```{r best_plot}
+test_taxon_abundance(s_lac, removed_cts, "lacgroup", a=removed_a)
+```
+
+
+
+
+
+
+
+```{r echo=TRUE}
+### Which OTU is the Treponema in our lactose phenotypers
+head(sort(rowSums(removed_cts[removed_a=="p__Spirochaetes g__Treponema",]),decreasing = TRUE), n=20)
+### manual lookup using linux 
+#### grep -A1 "denovo120 " swarm_otu/rep_set/seqs_rep_set.fasta
+#### grep -A1 "denovo123 " swarm_otu/rep_set/seqs_rep_set.fasta
+```
+
+```{r}
+cts_sum <- rowsum(removed_cts[,s_lac$SampleID], as.character(removed_a))
+
+s_lac$Trepo <- cts_sum["p__Spirochaetes g__Treponema",]
+
+#s_healthy_CF <- droplevels(subset(s_keepers, (s$study_group %in% "CF" | s$study_group %in% "Healthy")))
+```
+
+### Treponema Only
+```{r treponema_box}
+ggplot(s_lac)+ 
+  geom_boxplot(aes(x=Subsistence, y=Trepo))+
+  xlab("Subsistence Groups") +
+  ylab("Reads attributed") +
+  ggtitle("Observations of OTUs classified as Treponema")
+```
+
+
+
+
+## Between and Within-group unifrac distance boxplots
+
+### weighted_unifrac_boxplots_subsistence_sorted_by_evolutionary_distance
+
+```{r}
+distance_groups <- dist_groups(wtu, s$Super_Ethnicity)
+distance_groups2 <- subset(distance_groups, Group2 %in% "Hadzabe" | Group1 %in% "Hadzabe")
+distance_groups2$Label <- factor(distance_groups2$Label, levels=c(
+  "Within Hadzabe",
+  "Between Sandawe and Hadzabe",
+  "Between Khoisan and Hadzabe",
+  "Between Masaai and Hadzabe",
+  "Between Burunge and Hadzabe",
+  "Between Herero and Hadzabe",
+  "Between Niger_Kordofanian and Hadzabe",
+  "Between Philadelphian and Hadzabe",
+  "Between Hadzabe and Khoisan_NigerKordofanianMixed"
+))
+
+ggplot(distance_groups2)+
+ geom_boxplot(aes(x=Label, y=Distance))+
+ xlab("Super Ethnicity") +
+ ylab("Unifrac Distance") +
+ ggtitle("Weighted Unifrac distance") +
+ theme(
+ axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+ axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'),
+ axis.text.x=element_text(angle = -45, hjust = 0)
+ )
+```
+
+
+### weighted_unifrac_boxplots_subsistence_sorted_by_divergance
+```{r}
+distance_groups <- dist_groups(wtu, s$Super_Ethnicity)
+distance_groups2 <- subset(distance_groups, Group2 %in% "Hadzabe" | Group1 %in% "Hadzabe")
+distance_groups2$Label <- factor(distance_groups2$Label, levels=c(
+  "Within Hadzabe",
+  "Between Philadelphian and Hadzabe",
+  "Between Masaai and Hadzabe",
+  "Between Herero and Hadzabe",
+  "Between Niger_Kordofanian and Hadzabe",
+  "Between Burunge and Hadzabe",
+  "Between Khoisan and Hadzabe",
+  "Between Sandawe and Hadzabe",
+  "Between Hadzabe and Khoisan_NigerKordofanianMixed"
+))
+
+ggplot(distance_groups2)+
+ geom_boxplot(aes(x=Label, y=Distance))+
+ xlab("Super Ethnicity") +
+ ylab("Unifrac Distance") +
+ ggtitle("Weighted Unifrac distance") +
+ theme(
+ axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+ axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'),
+ axis.text.x=element_text(angle = -45, hjust = 0)
+ )
+```
+
+
+## lactose Unweighted Only
+```{r}
+mapping_subset <- s_lac
+metadata_col <- c("lacgroup", NULL) #second argument may be used as strata
+```
+
+### Presence/Absence Unifrac plots, colored by `r metadata_col`
+
+```{r unw_pcoa_lactose_lacgroup}
+unw_pcoa <- pcoa_1way(mapping_subset, unw, var=metadata_col[1], strata=metadata_col[2], ci=0.95)
+unw_pcoa$plot + geom_point(size=4)  + ggtitle("Unweighted Unifrac")+ theme(
+axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'))
+```
+
+#### Presence/Absence test for effect (group centroids), by `r metadata_col`
+
+```{r }
+udf <- droplevels(unw_pcoa$df)
+adonis(as.formula(paste("unw_pcoa$distances ~", paste(metadata_col,collapse="+"))), data=udf)
+```
+
+
+# specifically hunter gatherers what is KW different between TZ and Bots
+
+
+
+
+
+# PCOA with elipses only or highly downplayed points
+
+
+
+
+# indicator species analysis
+
+
+### Indicator Species analysis from Legendre
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Running multipatt:
+
+
+Rank <- "Genus"
+mapping_subset <- s
+metadata_col <- "Subsistence"
+# They use random permutations to assess p-values, so it's good to set a reproducible random seed
+set.seed(42)
+nperm <- 999
+```
+
+```{r}
+# Using indicspecies with a melted data frame
+otu.melt <- melt(removed_cts, varnames=c("otu", "SampleID"))
+otu.melt.joined <- inner_join(otu.melt, mapping_subset, by="SampleID")
+
+# Their input is actually not hard to work with. First we need to re-create the count matrix.
+# This creates a data frame with the sample ID and study group as the first two columns, then each column after that is an OTU name
+# (Replace column names as appropriate)
+mat <- otu.melt.joined1 %>% reshape2::dcast(as.formula(paste("SampleID +", metadata_col, " ~ otu")))
+
+# Next, we actually convert things into inputs
+# Hadley's stuff hates rownames, so we have to remake them
+rownames(mat) = mat$SampleID
+# This creates a separate StudyGroup vector (useful later)
+metadata_vector = mat[[metadata_col]]
+
+# Next, we remove these text columns from the matrix, so that we can (if we want) convert it to a well-formed numeric matrix.
+mat$SampleID <- NULL
+mat[[metadata_col]] <- NULL
+
+
+# Where the magic happens:
+indvals <- multipatt(mat, metadata_vector, control = how(nperm=nperm))
+# And here are the results:
+print(summary(indvals),indvalcomp=TRUE)
+
+
+# coverage statistics (i.e. is this even helpful?)
+print(coverage(mat, indvals))
+
+
+# Agropastoralist	199	21	133	
+# Pastoralist	255	0	0	#FF0000
+# Hunter-Gatherer	50	205	50	
+# Industrial Agriculturalist	160	82	45	
+
+plotcoverage(mat, indvals, group="Hunter Gatherer", lty=1, col="#32CD32")
+plotcoverage(mat, indvals, group="AgroPastoralist", lty=1, col="#C71585", add=TRUE)
+plotcoverage(mat, indvals, group="Industrial Agricultralist", lty=1, col="#A0522D", add=TRUE)
+plotcoverage(mat, indvals, group="Pastoralist", lty=1, col="#FF0000", add=TRUE)
+legend(x = 0.01, y=35, legend=c("Hunter Gatherer","AgroPastoralist", "Industrial Agricultralist", "Pastoralist" ), lty=c(1,1,1,1), col=c("green","blue","red", "orange"), bty="n")
+```
+
+```{r}
+sig_ind_vals <- subset(indvals$sign, p.value <= 0.05)
+sig_ind_vals$otu <- rownames(sig_ind_vals)
+mini_adf <- adf[row.names(sig_ind_vals),]
+mini_adf$otu <- rownames(mini_adf)
+write.csv(join( x= mini_adf,  y = sig_ind_vals, by = "otu"), "indicator_species_subsistence.txt")
+```
+
+
+### Agriculturalist
+```{r}
+# original code showed func= B or A.g
+prefstat = strassoc(mat, cluster=metadata_vector, func="B")
+# candidate list is present in 20% or more of metadata values
+candidates <- which(prefstat[,2]>0.7)
+sc.Ag <- indicators(X=mat[,candidates], cluster=metadata_vector, group="Agriculturalist", verbose=TRUE, At=0.5, Bt=0.2, max.indicators = 2)
+
+print(sc.Ag, sqrtIVt = 0.6)
+#how to interpret test statistics
+adf[c("denovo109","denovo68","denovo157"),]
+
+coverage(sc.Ag, At=0.6)
+```
+
+### Hunter Gatherer indicator species combinations
+```{r}
+# original code showed func= B or A.g
+prefstat = strassoc(mat, cluster=metadata_vector, func="B")
+# candidate list is present in 20% or more of metadata values
+candidates <- which(prefstat[,2]>0.7)
+sc.HG <- indicators(X=mat[,candidates], cluster=metadata_vector, group="Hunter Gatherer", verbose=TRUE, At=0.5, Bt=0.2, max.indicators = 1)
+
+print(sc.HG, sqrtIVt = 0.6)
+#how to interpret test statistics?
+adf[c("denovo1","denovo264"),]
+```
+
+### Percentage of Hunter Gatherers covered by these species at 50%
+```{r}
+coverage(sc.HG, At=0.5)
+```
+# i.e. rumminococcacaeae is a better indicator on its own than lachnospiracaeae and oscillospira put together
+
+### Pastoralist
+```{r}
+# original code showed func= B or A.g
+prefstat = strassoc(mat, cluster=metadata_vector, func="B")
+# candidate list is present in 20% or more of metadata values
+candidates <- which(prefstat[,2]>0.7)
+sc.P <- indicators(X=mat[,candidates], cluster=metadata_vector, group="Pastoralist", verbose=TRUE, At=0.5, Bt=0.2, max.indicators = 2)
+
+print(sc.P, sqrtIVt = 0.6)
+#how to interpret test statistics
+adf[c("denovo1","denovo264"),]
+
+coverage(sc.P, At=0.5)
+```
+
+### Agriculturalist
+```{r}
+# original code showed func= B or A.g
+prefstat = strassoc(mat, cluster=metadata_vector, func="B")
+# candidate list is present in 20% or more of metadata values
+candidates <- which(prefstat[,2]>0.7)
+sc.Ag <- indicators(X=mat[,candidates], cluster=metadata_vector, group="Agriculturalist", verbose=TRUE, At=0.5, Bt=0.2, max.indicators = 2)
+
+print(sc.Ag, sqrtIVt = 0.6)
+#how to interpret test statistics
+adf[c("denovo109","denovo68","denovo157"),]
+
+coverage(sc.Ag, At=0.6)
+```
+
+### Industrial Agriculturalist
+```{r}
+# original code showed func= B or A.g
+prefstat = strassoc(mat, cluster=metadata_vector, func="B")
+# candidate list is present in 20% or more of metadata values
+candidates <- which(prefstat[,2]>0.7)
+sc.IndAg <- indicators(X=mat[,candidates], cluster=metadata_vector, group="Industrial Agriculturalist", verbose=TRUE, At=0.5, Bt=0.2, max.indicators = 2)
+
+print(sc.IndAg, sqrtIVt = 0.6)
+#how to interpret test statistics
+adf[c("denovo109","denovo131","denovo142"),]
+
+coverage(sc.IndAg, At=0.5)
+```
+
+
+
+```{r}
+Rank <- "Family"
+mapping_subset <- s
+metadata_col <- "PopCode"
+ 
+ 
+otu.melt <- melt(removed_cts, varnames=c("otu", "SampleID"))
+otu.melt.joined1 <- inner_join(otu.melt, mapping_subset, by="SampleID")
+otu.cast <- dcast(otu.melt.joined1, paste("otu ~", "SampleID"), value.var="value", fun.aggregate=mean)
+otu.melt.again <- melt(otu.cast)
+otu.melt.joined2 <- merge(otu.melt.again, adf, by.x = "otu", by.y = "row.names")
+otu.mj2 <- tbl_df(otu.melt.joined2)
+#otu.mj3 <- otu.mj2 %>% group_by(variable) %>% filter(value/sum(value) > 0.001) %>% mutate(prop=value/sum(value))
+
+rank2<- c( Rank)
+test <- otu.mj2 %>% mutate(prop=value/sum(value)) %>% group_by_(.dots=rank2) %>% summarize(avg=sum(value)) %>% arrange(desc(avg))
+View(head(test,50))
+
+
+#rank2<- c( Rank, "variable")
+#test <- otu.mj2 %>% mutate(prop=value/sum(value)) %>% group_by_(.dots=rank2) %>% summarize(prop=sum(prop)) %>% arrange(desc(prop))
+
+
+#otu.mj4 <- otu.mj3 %>% group_by_(.dots=rank2) %>% summarize(prop=sum(prop))
+#otu.mj4 <- arrange(otu.mj4, desc(Family, prop))
+
+
+print(coverage(mat, indvals))
+
+plotcoverage(mat, indvals, group="BWBH", lty=1, col="#66c2a5")
+plotcoverage(mat, indvals, group="BWBO", lty=1, col="#fc8d62", add=TRUE)
+plotcoverage(mat, indvals, group="BWSN", lty=1, col="#8da0cb", add=TRUE)
+plotcoverage(mat, indvals, group="TZBB", lty=1, col="#e78ac3", add=TRUE)
+plotcoverage(mat, indvals, group="TZHZ", lty=1, col="#a6d854", add=TRUE)
+plotcoverage(mat, indvals, group="TZMS", lty=1, col="#ffd92f", add=TRUE)
+plotcoverage(mat, indvals, group="TZSW", lty=1, col="#e5c494", add=TRUE)
+legend(x = 0.01, y=65, legend=c("BWBH","BWBO", "BWSN", "TZBB", "TZHZ", "TZMS", "TZSW" ), lty=c(1,1,1,1), col=c("green","blue","red", "orange"), bty="n")
+
+```
+
+```{r}
+sig_ind_vals <- subset(indvals$sign, p.value <= 0.05)
+sig_ind_vals$otu <- rownames(sig_ind_vals)
+mini_adf <- adf[row.names(sig_ind_vals),]
+mini_adf$otu <- rownames(mini_adf)
+write.csv(join( x= mini_adf,  y = sig_ind_vals, by = "otu"), "indicator_species_ethnicity.txt")
+```
+
+
+```{r}
+coloring
+# Group	R	G	B	HEX
+# Agropastoralist	199	21	133	#C71585
+# Pastoralist	255	0	0	#FF0000
+# Hunter-Gatherer	50	205	50	#32CD32
+# Industrial Agriculturalist	160	82	45	#A0522D
+# Tanzania	205	175	149	#CDAF95
+# Botswana	230	230	250	#E6E6FA
+# USA	119	136	153	#778899
+# 
+# BWBH	102	194	165	#66c2a5
+# BWBO	252	141	98	#fc8d62
+# BWSN	141	160	203	#8da0cb
+# TZBB	231	138	195	#e78ac3
+# TZHZ	166	216	84	#a6d854
+# TZMS	255	217	47	#ffd92f
+# TZSW	229	196	148	#e5c494
+```
+
+```{r}
+# final edits:
+#   Hi Team, 
+# 
+# First, please disregard the v5 that I sent out earlier today and refer to the one in the google drive. Jaanki, I've added you to this google drive; please let me know that you are able to access it. 
+# 
+# We need to use the v5 mapping file on the drive and redo the Vanilla R analysis that Aubrey did before. This will remove the Niger_Kordofanians and some outliers. Do not use Super_Ethnicity for any future analyses! Use PopCode. This replaces Super_Ethnicity.
+# 
+# We need two versions of every figure- one with and one without the title in the graphic as these are subject to change. Any figure that involves an ethnic group should have a color. So on "Observations of OTUs rarefied to 5000[...]" every ethnic group should have an RGB value that is consistent throughout the analysis. Matt will send these RGB values in Data -->Plotting Parameters-->plot_params.txt. 
+# 
+# Anytime we see "ethnicity" in a title, change to "Population."
+# 
+# Alpha Diversity
+# -No titles of labels on x axis. Population codes can be printed vertical. 
+# -Rarefaction ("Number of OTUs rarefied to 5000 observations...")- Order pops by country along x axis. Be consistent across all box and whiskers style plots. 
+# -Shannon's- Order pops by country, etc. Same as above.
+# -Shrink dots that are outliers- draws the eye. Do this for other box and whiskers plots too. 
+# 
+# Beta Diversity Analyses
+# -The key needs to be visible on the right. Top is truncated. 
+# -Color bar scale needs to shrunk. 
+# -Very similar colors need to be split apart- for instance, both greens are very similar and should be colored differently. 
+# -Remove "study group" from x axis
+# -No f_ on the taxa; just have the family name, we'll put "family" on top of the columns or in the description. 
+# 
+# PCoA
+# -Symbols could be a tad smaller. 
+# -Colors need to match ethnic group RGB colors
+# -Needs legend titles for "Subsistence" and "Population"
+# 
+# Presence/Absence Unifrac and Abundance Weighted Unifrac
+# -Needs to include all Populations
+# -Super_Ethnicity label on legend needs to be "Population"
+# -Colors need to match Matt's text file RGB
+# 
+# Kruskal Wallace
+# -For all Kruskal Wallace, the only ones that we want to show need to have proportion minimums above 1% in at least one group. 
+# -Labels need to be contained within the header rectangle (i.e., Phascolarctobacterium runs off the square)
+# If all the bacteria area t the same taxonomic level. 
+# -Need two version of these- one where header above each test has p_somename g_some name and one that says some name_some name (eliminate p and g). 
+# -Boxes should also be colored by population. 
+# -For Y axis numbers- adjust tick density so numbers don't crowd together (See Phascolarcto again for a reference of what we're referring to). 
+# 
+# Tanzania Krukal Wallace
+# Very condense. Not sure what's going on here.
+# 
+# Heatmap
+# -remove x16s top row- this was an internal test for our data. Remove legend for this as well. 
+# -Column ordering needs to be done by country and then second to that by population
+# -Row ordering -Order the taxa by mean abundance over the entire cohort. Therefore Prevotella should become the top hit on the list and by eye you should see increasingly less abundant taxa. (Matt says he can mock up some clustering of this as well to cluster by rows and columns)
+# 
+# Aubrey- 
+# Redo LCT analyses between all ethnic groups (as we have reduced # of individuals in the mapping file) 
+# Redo "LCT binary" for between individuals that had no LP and ones that had any LP 
+# Redo RFC on same categories we did before
+# 
+# Jaanki
+# GLM on Prevotella and Bacteroides- can it predict groups based off of relative abundance? 
+
+```
+
+
+
+
+
+
+### Indicator Species analysis from Legendre
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Running multipatt:
+Rank <- "Genus"
+mapping_subset <- s
+metadata_col <- "Country"
+# They use random permutations to assess p-values, so it's good to set a reproducible random seed
+set.seed(9949222)
+nperm <- 999
+```
+
+```{r}
+# Using indicspecies with a melted data frame
+otu.melt <- melt(removed_cts, varnames=c("otu", "SampleID"))
+otu.melt.joined <- inner_join(otu.melt, mapping_subset, by="SampleID")
+
+# Their input is actually not hard to work with. First we need to re-create the count matrix.
+# This creates a data frame with the sample ID and study group as the first two columns, then each column after that is an OTU name
+# (Replace column names as appropriate)
+mat <- otu.melt.joined1 %>% reshape2::dcast(as.formula(paste("SampleID +", metadata_col, " ~ otu")))
+
+# Next, we actually convert things into inputs
+# Hadley's stuff hates rownames, so we have to remake them
+rownames(mat) = mat$SampleID
+# This creates a separate StudyGroup vector (useful later)
+metadata_vector = mat[[metadata_col]]
+
+# Next, we remove these text columns from the matrix, so that we can (if we want) convert it to a well-formed numeric matrix.
+mat$SampleID <- NULL
+mat[[metadata_col]] <- NULL
+
+
+# Where the magic happens:
+indvals <- multipatt(mat, metadata_vector, control = how(nperm=nperm))
+# And here are the results:
+print(summary(indvals),indvalcomp=TRUE)
+
+
+# coverage statistics (i.e. is this even helpful?)
+print(coverage(mat, indvals))
+
+plotcoverage(mat, indvals, group="Tanzania", lty=1, col="green")
+plotcoverage(mat, indvals, group="Botswana", lty=1, col="blue", add=TRUE)
+plotcoverage(mat, indvals, group="US", lty=1, col="red", add=TRUE)
+legend(x = 0.01, y=35, legend=c("TZMS","TZBB", "TZHZ", "TZSW" ), lty=c(1,1,1,1), col=c("green","blue","red", "orange"), bty="n")
+```
+
+
+
+
+
+
+
+
+# bar charts for specific OTU list
+```{r}
+otu.melt <- melt(removed_cts, varnames=c("otu", "SampleID"))
+otu.melt.joined <- inner_join(otu.melt, s, by="SampleID")
+#paste your comma separated list in here and recieve great justice
+plotme <- otu.melt.joined[otu.melt.joined$otu == c("denovo1", "denovo6", "denovo999"),]
+```
+
+### otus raw counts as bars
+```{r treponema_box}
+ggplot(plotme, aes(x=SampleID, y=value))+ 
+  geom_bar(stat="identity", aes(color=Country)) +
+  facet_grid(. ~ otu) +
+  xlab("SampleID") +
+  ylab("Reads attributed") +
+  ggtitle("Observations of this OTUs") +
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+```
+
+```{r}
+distance_groups <- dist_groups(wtu, s$Super_Ethnicity)
+distance_groups2 <- subset(distance_groups, Group2 %in% "Hadzabe" | Group1 %in% "Hadzabe")
+distance_groups2$Label <- factor(distance_groups2$Label, levels=c(
+  "Within Hadzabe",
+  "Between Philadelphian and Hadzabe",
+  "Between Masaai and Hadzabe",
+  "Between Herero and Hadzabe",
+  "Between Niger_Kordofanian and Hadzabe",
+  "Between Burunge and Hadzabe",
+  "Between Khoisan and Hadzabe",
+  "Between Sandawe and Hadzabe",
+  "Between Hadzabe and Khoisan_NigerKordofanianMixed"
+))
+
+
+library(ape)
+http://svitsrv25.epfl.ch/R-doc/library/ape/html/root.html
+tree <- nj(as.dist(distance_groups))
+           #, "unrooted") > plot(arbol)
+root(tree, outgroup="USA1")
+```
+```{r}
+library(ggplot2)
+library(dplyr) #make sure dplyr is not loaded (if so, click out of it). Check and uncheck plyr to reload.
+library(readr)
+qPCR_plotdata <- read_delim("~/16S_qPCR_plotdata.txt", 
++     "\t", escape_double = FALSE, trim_ws = TRUE)
+
+#Make one of ethnicity that shows controls and one that doesn't
+qPCR <- X16S_qPCR_plotdata
+View(qPCR)
+
+qPCR <- as.data.frame(qPCR)
+qPCR$Ethnicity <- as.factor(qPCR$Ethnicity)
+qPCR <- qPCR[-c(64:95), ]
+
+qPCR_Ethnicity_cntrl<- qPCR %>% 
+  mutate(Ethnicity = factor(Ethnicity, levels = c('Burunge', 'Hadza', 'Maasai', 'Sandawe', 'Bantu', 'Herero', 'San', 'Control'), labels = c("Burunge", "Hadza", "Maasai", "Sandawe", "Bantu", "Herero", "San", "Control"))) %>% 
+  ggplot(aes(x = Ethnicity, y = copy_per_ul_corrected, group = Ethnicity, fill = Ethnicity)) +
+    geom_boxplot(alpha = .7) +
+    geom_jitter(width = .05, alpha = .4) +
+    guides(fill = "none") +
+    scale_fill_manual(breaks = c('Burunge', 'Hadza', 'Maasai', 'Sandawe','Bantu', 'Herero', 'San','Control'), values=c('#FF8B04','#39C6E9','#EC3749','#F577F9','#E9D96E','#F284B0','#869CF3','#778899'))    +
+    theme_bw() +
+    labs(
+      x = "Population",
+      y = "16S rRNA Copy Number per uL sample"
+    )
+plot(qPCR_Ethnicity_cntrl)
+#compare means using default wilcoxon rank-rum 
+qPCR$copyNumber <- qPCR$copy_per_ul_corrected
+compare_means(copyNumber ~ Ethnicity, data = qPCR, ref.group = '.all.', method = 'wilcox.test', p.adjust.method = 'fdr') 
+ # qPCR + geom_hline(yintercept = mean(qPCR$Ethnicity), linetype = 2)+ # Add horizontal line at base mean
+qPCR_Ethnicity_cntrl <- qPCR_Ethnicity_cntrl+stat_compare_means(method = "anova", label.y = 7e+08) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "wilcox.test",
+                     ref.group = ".all.")  + geom_hline(yintercept = mean(qPCR$copyNumber), linetype = 2)
+
+plot(qPCR_Ethnicity_cntrl)
+
+##16S and ethnicity minus controls, log transformed
+qPCR_nocontrol <- qPCR[-c(21:31), ]
+qPCR_nocontrol <- qPCR_nocontrol2
+#8326e0 Bantu_1
+#25e067 Bantu_2
+qPCR_Ethnicity<- qPCR_nocontrol2 %>% 
+  mutate(Ethnicity = factor(Ethnicity, levels = c('Burunge', 'Hadza', 'Maasai', 'Sandawe', 'Herero', 'San', 'All_Bantu','Bantu_1','Bantu_2','Control'), labels = c("Burunge", "Hadza", "Maasai", "Sandawe", 'Herero', 'San', 'All_Bantu', 'Bantu_1','Bantu_2',"Control"))) %>% 
+  ggplot(aes(x = Ethnicity, y = copy_num_per_gram_of_feces_corrected, group = Ethnicity, fill = Ethnicity)) + 
+  #coord_cartesian(ylim = c(0e+00, 5e+9)) +
+    geom_boxplot(alpha = .7) +
+    geom_jitter(width = .05, alpha = .4) +
+    guides(fill = "none") +
+    scale_fill_manual(breaks = c('Burunge', 'Hadza', 'Maasai', 'Sandawe', 'Herero', 'San','All_Bantu', 'Bantu_1', 'Bantu_2', 'Control'), values=c('#FF8B04','#39C6E9','#EC3749','#F577F9','#F284B0','#869CF3','#E9D96E','#8326e0', '#25e067', '#778899'))    +
+    theme_bw() +
+    labs(
+      x = "Population",
+      y = "16S rRNA gene (copies/g)"
+    )
+plot(qPCR_Ethnicity)
+#compare means using default wilcoxon rank-rum 
+qPCR_nocontrol$copyNumber <- qPCR_nocontrol$copy_num_per_gram_of_feces_corrected
+compare_means(copyNumber ~ Ethnicity, data = qPCR_nocontrol, ref.group = '.all.', method = 'wilcox.test', p.adjust.method = 'fdr') 
+ # qPCR + geom_hline(yintercept = mean(qPCR$Ethnicity), linetype = 2)+ # Add horizontal line at base mean
+qPCR_Ethnicity+stat_compare_means(method = "anova", label.y = 7e+10) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "wilcox.test",
+                     ref.group = ".all.")  + geom_hline(yintercept = mean(qPCR_nocontrol$copyNumber), linetype = 2)
+ 
+
+
+#Country comparison, no controls
+#qPCR$Country <- as.factor(qPCR$Country)
+#qPCR$Country <- as.character(qPCR$Country)
+#qPCR$Country[16:31]<- NULL
+qPCR_nocontrol <- qPCR[-c(21:31), ]
+qPCR_nocontrol<-qPCR_naocontrol2
+qPCR_nocontrol$Country<- droplevels((qPCR_nocontrol$Country))
+qPCR_nocontrol$Country <- as.factor(qPCR_nocontrol$Country)
+
+qPCR_Country_plot<- qPCR_nocontrol %>% 
+  mutate(Country = factor(Country, levels = c('Botswana', 'Tanzania', 'Control'), labels = c('Botswana', 'Tanzania', 'Control'))) %>% 
+  ggplot(aes(x = Country, y = copy_num_per_gram_of_feces_corrected, group = Country, fill = Country)) + #scale_y_continuous(trans='log10') +
+ coord_cartesian(ylim = c(0e+00, 5e+09)) +
+    geom_boxplot(alpha = .7) +
+    geom_jitter(width = .05, alpha = .4) +
+    guides(fill = "none") +
+    scale_fill_manual(breaks = c('Botswana', 'Tanzania', 'Control'), values=c('#E6E6FA','#CDAF95','#778899'))    +
+    theme_bw() +
+    labs(
+      x = "Country",
+      y = "16S rRNA gene (copies/g)"
+    )
+    plot(qPCR_Country_plot)
+#compare means using default wilcoxon rank-rum, only 2 groups, NO ANOVA
+qPCR_nocontrol$copyNumber <- qPCR_nocontrol$copy_num_per_gram_of_feces_corrected
+compare_means(copyNumber ~ Country, data = qPCR_nocontrol, ref.group = '.all.', method = 'wilcox.test', p.adjust.method = 'fdr') 
+qPCR_Country_plot<- qPCR_Country_plot+stat_compare_means(method = "wilcox.test", label.y = 5e+09) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "wilcox.test",
+                     ref.group = ".all.")  + geom_hline(yintercept = mean(qPCR_nocontrol$copyNumber), linetype = 2)
+plot(qPCR_Country_plot)
+
+
+
+#Subsistence comparison, no controls
+qPCR_nocontrol <- qPCR[-c(21:31), ]
+qPCR_nocontrol$Subsistence <- as.factor(qPCR_nocontrol$Subsistence)
+#qPCR$Country <- as.character(qPCR$Country)
+#qPCR$Country[16:31]<- NULL
+qPCR_nocontrol$Subsistence<- droplevels((qPCR_nocontrol$Subsistence))
+qPCR_nocontrol$Subsistence <- as.factor(qPCR_nocontrol$Subsistence)
+
+qPCR_Subsistence_plot<- qPCR_nocontrol %>% 
+  mutate(Subsistence = factor(Subsistence, levels = c('Agropastoralist', 'Hunter-Gatherer', 'Pastoralist'), labels = c('Agropastoralist', 'Hunter-Gatherer', 'Pastoralist'))) %>% 
+  ggplot(aes(x = Subsistence, y = copy_num_per_gram_of_feces_corrected, group = Subsistence, fill = Subsistence)) +
+   coord_cartesian(ylim = c(0e+00, 5e+09)) +
+    geom_boxplot(alpha = .7) +
+    geom_jitter(width = .05, alpha = .4) +
+    guides(fill = "none") +
+    scale_fill_manual(breaks = c('Agropastoralist', 'Hunter-Gatherer', 'Pastoralist'), values=c('#C71585','#0080FF','#FF0000'))    +
+    theme_bw() +
+    labs(
+      x = "Subsistence",
+      y = "16S rRNA gene (copies/g)"
+    )
+plot(qPCR_Subsistence_plot)
+
+#compare means using default wilcoxon rank-rum 
+qPCR_nocontrol$copyNumber <- qPCR_nocontrol$copy_num_per_gram_of_feces_corrected
+compare_means(copyNumber ~ Subsistence, data = qPCR_nocontrol, ref.group = '.all.', method = 'wilcox.test', p.adjust.method = 'fdr') 
+ # qPCR + geom_hline(yintercept = mean(qPCR$Ethnicity), linetype = 2)+ # Add horizontal line at base mean
+qPCR_Subsistence_plot <- qPCR_Subsistence_plot+stat_compare_means(method = "kruskal.test", , label.y = 5e+09) +        # Add global annova p-value
+  stat_compare_means(label = "p.signif", method = "kruskal.test",
+                     ref.group = ".all.")  + geom_hline(yintercept = mean(qPCR_nocontrol$copyNumber), linetype = 2)
+plot(qPCR_Subsistence_plot)
+
+
+#Plot qPCR corrected copy number per gram to Shannon div
+qPCR_nocontrol <- qPCR[-c(21:31), ]
+
+ggplot(qPCR_nocontrol, aes(copy_num_per_gram_of_feces_corrected, Shannon_div)) +
+        geom_point(aes(color = Subsistence)) + 
+
+qPCR_shannondiv_plot <- qPCR_nocontrol %>% 
+  mutate(Subsistence = factor(Subsistence, levels = c('Agropastoralist', 'Hunter-Gatherer', 'Pastoralist'), labels = c('Agropastoralist', 'Hunter-Gatherer', 'Pastoralist'))) %>% 
+ggplot(aes(x = Shannon_div, y = copy_num_per_gram_of_feces_corrected, fill = Subsistence)) +
+    geom_point(alpha = .7) +
+    geom_jitter(width = .05, alpha = .4) +
+    guides(fill = "none") +
+    scale_fill_manual(breaks = c('Agropastoralist', 'Hunter-Gatherer', 'Pastoralist'), values=c('#C71585','#0080FF','#FF0000'))    +
+    theme_bw() +
+    labs(
+      x = "Shannon Diversity",
+      y = "16S rRNA gene (copies/g)"
+    )
+
+testplot<- ggplot(qPCR_nocontrol,aes(Shannon_div,                                       copy_num_per_gram_of_feces_corrected))+stat_summary(fun.data=mean_cl_normal) + 
+  geom_smooth(method='lm')
+
+#Calculate standard error of the mean
+#aggregate(hp ~ carb + am, mtcars, mean) #Dependent variable ~ grouping variable + second optional grouping variable, df, mean)
+
+qpcragg <- aggregate(copy_num_per_gram_of_feces_corrected ~ Ethnicity, qPCR_nocontrol, mean)
+
+
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+}
+
+SE_qpcr <- aggregate(copy_num_per_gram_of_feces_corrected ~ Ethnicity, qPCR_nocontrol, st.err)
+# Same, but with different colors and add regression lines 1.51E10^+09
+
+#This section produces R2 values to add append into plot for shannon diversity to 16S values
+ggplotRegression <- function (fit) {
+
+require(ggplot2)
+
+ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+  geom_point() +
+  stat_smooth(method = "lm", col = "red") +
+  labs(title = paste("Adj R2 = ",signif(summary(fit)$adj.r.squared, 5),
+                     "Intercept =",signif(fit$coef[[1]],5 ),
+                     " Slope =",signif(fit$coef[[2]], 5),
+                     " P =",signif(summary(fit)$coef[2,4], 5)))
+}
+fit1 <- lm(copy_num_per_gram_of_feces_corrected ~ Shannon_div, data = qPCR_nocontrol)
+ggplotRegression(fit1)
+
+"R2 = -0.011247 Intercept = 594820000 Slope = 136660000 P = 0.51364" #This is what you manually feed into title, output of function above
+
+library(devtools)
+
+Shannon_div_colored_16Splot <- ggplot(qPCR_nocontrol, aes(Shannon_div, copy_num_per_gram_of_feces_corrected, color = Subsistence)) +
+    geom_point(shape=19) + 
+     geom_smooth(method=lm, na.rm = TRUE, fullrange= TRUE,
+               aes(group=1),colour="black") +
+ # geom_jitter(width = 1, alpha = .4) +
+  scale_color_manual(values=c('#C71585','#0080FF','#FF0000'))+
+   theme(legend.position="right") +
+  theme_bw() + 
+   labs(title = "R2 = -0.011247 Intercept = 594820000 Slope = 136660000 P = 0.51364",
+      x = "Shannon Diversity",
+      y = "16S rRNA gene (copies/g)"
+    )# Don't add shaded confidence region
+
+Shannon_div_colored_16Splot_ethnicity <- ggplot(qPCR_nocontrol, aes(Shannon_div, copy_num_per_gram_of_feces_corrected, color = Ethnicity)) +
+    coord_cartesian(ylim = c(0e+00, 1e+10)) +
+    geom_point(shape=19) + 
+     geom_smooth(method=lm, na.rm = TRUE, fullrange= TRUE,
+               aes(group=1),colour="black") +
+ # geom_jitter(width = 1, alpha = .4) +
+  scale_color_manual(values=c('#FF8B04','#39C6E9','#EC3749','#F577F9','#E9D96E','#F284B0','#869CF3','#8326e0', '#25e067'))+
+   theme(legend.position="right") +
+  theme_bw() + 
+   labs(title = "R2 = -0.011247 Intercept = 594820000 Slope = 136660000 P = 0.51364",
+      x = "Shannon Diversity",
+      y = "16S rRNA gene (copies/g)"
+    )# Don't add shaded confidence region
+plot(Shannon_div_colored_16Splot_ethnicity)
+'#8326e0', '#25e067'
+
+Shannon_div_colored_16Splot_country <- ggplot(qPCR_nocontrol, aes(Shannon_div, copy_num_per_gram_of_feces_corrected, color = Country)) +
+    geom_point(shape=19) + 
+     geom_smooth(method=lm, na.rm = TRUE, fullrange= TRUE,
+               aes(group=1),colour="black") +
+ # geom_jitter(width = 1, alpha = .4) +
+  scale_color_manual(values=c('#E6E6FA','#CDAF95'))+
+   theme(legend.position="right") +
+  theme_bw() + 
+   labs(title = "R2 = -0.011247 Intercept = 594820000 Slope = 136660000 P = 0.51364",
+      x = "Shannon Diversity",
+      y = "16S rRNA gene (copies/g)"
+    )# Don't add shaded confidence region
+
+Group	R	G	B	HEX
+Agropastoralist	199	21	133	#C71585
+AgroPastoralist	199	21	133	#C71585
+Agriculturalist	199	21	133	#C71585
+Pastoralist	255	0	0	#FF0000
+Hunter-Gatherer	0	128	255	#0080FF
+Hunter Gatherer	0	128	255	#0080FF
+Agriculturalist	255	154	0	#FF9A00
+Industrial Agriculturalist	160	82	45	#A0522D
+Tanzania	205	175	149	#CDAF95
+Botswana	230	230	250	#E6E6FA
+USA	119	136	153	#778899
+Africa	199	21	133	#C71585
+BWBH	242	132	176	#F284B0
+BWBO	140	102	47	#8C662F
+BWSN	134	156	243	#869CF3
+TZBB	250	173	19	#FF8B04
+TZHZ	57	198	233	#39C6E9
+TZMS	236	55	73	#EC3749
+TZSW	245	119	249	#F577F9
+```
+
+
+
+
+
+
+
+
+
+
+
+

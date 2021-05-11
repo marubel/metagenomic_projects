@@ -1,0 +1,471 @@
+---
+title: "Rebiotix study part 3"
+author: "Aubrey Bailey"
+date: "01/28/2015"
+output: html_document
+---
+##16S analysis of longitudinal incubated artifical fecal transplant donations
+
+```{r setup, echo=FALSE}
+#Creates figure image files in Knit folder 
+library(knitr)
+opts_chunk$set(
+  tidy=FALSE,
+  cache=F,
+  echo=F,
+  dpi=100,
+  fig.width=6,
+  fig.path="Knit/figure/",
+  cache.path="Knit/cache/",
+  dev=c("png", "pdf", "postscript"))
+```
+
+```{r load scripts, echo=FALSE, message=FALSE}
+#Load scripts for 16S analysis
+library(qiimer)
+library(ape)
+library(vegan)
+library(ggplot2)
+library(plyr)
+library(reshape2)
+library(kylemisc)
+```
+
+# make fake OTU table
+```{r}
+num_groups <- 3
+subj_per_group <- 6
+num_tests <- 2
+cts  <- simStudy(group_size_vector = c(subj_per_group, num_groups, num_tests),
+                otu_number=10,
+                sequence_depth=1000,
+                rare_depth = 0.8,
+#                 effect_range = seq(0,0.3,length.out=100)
+)
+head(cts,1)
+
+
+#unifracs <- GUniFrac(otu.tab.rff, throat.tree, alpha=c(0, 0.5, 1))$unifracs
+#dw <- unifracs[, , "d_1"]
+```
+
+```{r DeNOVO OTU code, echo=FALSE}
+# Assign sample mapping file
+s <- read_qiime_mapping_file("P55_mapping_Rbx_UPenn.txt")
+
+# Replicate sample
+s_original <- subset(s, Sample.Pooling %in% "Original")
+
+# Assign OTU table
+o <- read_qiime_otu_table("otu/classic_otu_table.txt")
+
+# Metadata in the form of truncated green genes assignments
+md <- sub("(; [kpcofgs]__)+$", "", o$metadata, perl=T)
+
+# Assignments data-frame
+adf <- split_assignments(md)
+a <- simplify_assignments(adf)
+
+# Arrange s by StudyGroup, then by SubjectID, then by Age_bin
+s <- arrange(s, StudyGroup, SubjectID, Age_bin)
+
+# Check for invalid sample IDs
+problem_ids <- setdiff(s$SampleID, colnames(o$counts))
+if (length(problem_ids ) > 0) stop (simpleError(paste("id mismatch found", problem_ids, collapse=" ")))
+
+# Assignment counts per SampleID
+cts <- o$counts[,s$SampleID]
+```
+
+## --------------------------------------------------------
+### Sample structure for original stool design  
+```{r}
+table(s_original$Collection_Day, s_original$Replicate_Number, dnn=c("Day","Replicate"))
+```
+### Sample Structure for pooled stool deisgn
+```{r}
+table(s$Collection_Day, s$Drug_SubstanceSample_ID, dnn=c("Day","Batch"))
+```
+## --------------------------------------------------------
+
+```{r}
+read_counts <- read.csv("library/split_library_log.txt", sep="\t", skip=15, strip.white = FALSE, blank.lines.skip = TRUE,  header=FALSE, nrows = length(file) -1, col.names=c("SampleID", "Read Counts"))
+
+read_counts <- read_counts[order(read_counts$SampleID), ]
+read_counts[1:(nrow(read_counts)-2),]
+```
+
+##---------------------------------------------------------
+
+## Alpha Diversity
+
+### Alpha diversity at enrollment (t1)
+
+Prior to study enrollment, infants in the Formula A and B groups were on a variety of formula diets.
+
+```{r alpha_diversity,echo=FALSE}
+ad <- read_qiime_rarefaction("alpha_diversity/alpha_div_collated/observed_species.txt")
+```
+
+```{r alpha_diversity_join, echo=FALSE}
+rs <- rarefaction_stats(ad)
+rs_t1_joined <- merge(s_original, rs, by="SampleID")
+rs_joined <- merge(s, rs, by="SampleID")
+```
+
+```{r fig.width=6, fig.height=4, echo=FALSE}
+ggplot(rs_t1_joined, aes(x=sequences_per_sample, y=diversity.mean, ymin=0, ymax=0, group=SampleID, color=Collection_Day)) + 
+  stat_smooth(method = "loess", formula = y ~ x,  se = TRUE, alpha=.3) +
+  xlab("Sequences Per Sample") +
+  ylab("Mean Observed Species") +
+  ggtitle("Alpha Diversity Rarefaction Curves\n Observed Species")
+  #geom_errorbar(aes(ymin=diversity.mean - diversity.sd, ymax=diversity.mean + diversity.sd)) +
+  #geom_point( shape=21, size=3) + # 21 is filled circle
+  #scale_color_manual(values=c("BREASTFED"="red","FORMULA A"  ="blue","FORMULA B"="green"))
+```
+
+```{r, fig.width=6, fig.height=4, echo=FALSE}
+ggplot(rs_t1_joined, aes(x=sequences_per_sample, y=diversity.mean, ymin=0, ymax=0, group=SampleID, color=StudyGroup)) + 
+  stat_smooth(method = "loess", formula = y ~ x,  se = TRUE, alpha=.3) +
+  xlab("Sequences Per Sample") +
+  ylab("Mean Observed Species") +
+  ggtitle("Alpha Diversity Rarefaction Curves\n Observed Species") +
+
+```
+
+
+## --------------------------------------------------------
+
+### De Novo OTU Heatmap
+
+```{r overall_heatmap_annotations, echo=FALSE}
+annotations <- s[,c("SubjectID","StudyGroup","Age_bin")]
+rownames(annotations) <- s$SampleID
+```
+
+```{r simOTU_Heatmap, fig.width=15, fig.height=10, echo=FALSE}
+otu_heatmap(
+  cts, rownames(cts), threshold=200, 
+  color = saturated_rainbow(max(colSums(cts)), saturation_limit = 0.4), 
+  cluster_cols = FALSE, cluster_rows = FALSE, fontsize_col = 12, fontsize_row = 12, 
+  legend = TRUE, cellheight=12, cellwidth=12)
+```
+
+```{r DeNovoOTU_Heatmap, fig.width=15, fig.height=10, echo=FALSE}
+# otu_heatmap(
+#   cts, a, annotation=annotations, threshold=1000, 
+#   color = saturated_rainbow(max(colSums(cts)), saturation_limit = 0.4), 
+#   cluster_cols = FALSE, cluster_rows = FALSE, fontsize_col = 12, fontsize_row = 12, 
+#   legend = TRUE, cellheight=12, cellwidth=12)
+```
+
+```{r subject_heatmap_annotations, echo=FALSE}
+annotations <- s[,c("SubjectID","InfantDiet","Age_bin")]
+rownames(annotations) <- s$SampleID
+```
+
+### Heatmaps by Subject
+3-4 samples were collected from each of the 15 subjects at separate timepoints, over a span of approximately 100 days.
+
+```{r Heatmap_by_SubjectID, fig.width=8, fig.height=7, echo=FALSE}
+ann_colors <- list(
+  InfantDiet=c("\"PHF, CMF\""="purple","BREASTFED"="red","CMF"="orange","FORMULA A"="blue","FORMULA B"="green","PHF"="yellow","SOY"="gray"), 
+  Age_bin=c("1"="red","2"="orange","3"="green","4"="blue"))                                                                                     
+
+ann_colors$Age_bin <- as.factor(ann_colors$Age_bin)
+s$Age_bin <- as.factor(s$Age_bin)
+
+#Heatmap maker with loop
+d_ply(s, .(SubjectID), function (x) {
+   title <- paste(x[1,"SubjectID"])
+   otu_heatmap(
+     cts[,x$SampleID], a, annotation=annotations[,c("Age_bin","InfantDiet")], threshold=400, main=title, annotation_colors=ann_colors, 
+     color = saturated_rainbow(max(colSums(cts)), saturation_limit = 0.40), 
+    cluster_cols = FALSE, cluster_rows = FALSE, fontsize_col = 10, fontsize_row = 10, 
+    legend = TRUE, cellheight=12, cellwidth=10)
+})
+```
+
+### Heatmaps by Age Bin (1-4)
+
+```{r Heatmap_by_Age_bin, fig.width=10, fig.height=8, echo=FALSE}
+# Arrange s by InfantDiet
+# s <- arrange(s, InfantDiet, SubjectID)
+
+#Heatmap maker with loop
+
+ann_colors <- list(
+  InfantDiet=c("BREASTFED"="red","FORMULA A"="blue","FORMULA B"="green","PHF"="yellow","CMF"="orange","\"PHF, CMF\""="purple","SOY"="gray")
+)                                                                                         
+
+d_ply(s, .(Age_bin), function (x) {
+   title <- paste(x[1,"Age_bin"])
+   otu_heatmap(
+     cts[,x$SampleID], a, annotation=annotations[
+       ,c("SubjectID","InfantDiet")], threshold=400, main=title, annotation_colors=ann_colors, 
+     color = saturated_rainbow(max(colSums(cts)), saturation_limit = 0.40), 
+    cluster_cols = FALSE, cluster_rows = FALSE, fontsize_col = 10, fontsize_row = 10, 
+    legend = TRUE, cellheight=12, cellwidth=10)
+})
+```
+
+## --------------------------------------------------------
+
+```{r echo=FALSE, message=FALSE}
+#unw <- read_qiime_distmat("beta_diversity/unweighted_unifrac_dm.txt")
+#wtu <- read_qiime_distmat("beta_diversity/weighted_unifrac_dm.txt")
+wtu <- calcWJstudy(otu_table = cts)
+groupNames(wtu)
+```
+
+```{r pcoa_1way, echo=FALSE, message=FALSE}
+#' Perform a PCoA analysis of one variable
+#' @param s The sample table
+#' @param d A distance matrix.  The matrix will be trimmed to include only the samples in `s`.
+#' @param var The variable of interest (string)
+#' @param strata If data is stratified, the name of the column containing the strata
+#' @param ci Confidence interval to plot ellipse around. NULL if not plotted.
+pcoa_1way <- function(s, d, var="StudyGroup", strata=NULL, ci=NULL) {
+  # Select columns of interest from distance matrix
+  distances <- dist_subset(d, s$SampleID)
+
+  res <- list()
+  
+  # Run the actual PCoA ordination
+  res$pcoa <- pcoa(distances)
+  
+  # Save distances and sample info back into result
+  res$distances <- distances
+  res$df <- cbind(s, res$pcoa$vectors[,1:2])
+  
+  # Make a simple plot, save in result
+  res$plot <- ggplot(res$df, aes_string(x="Axis.1", y="Axis.2", color=var)) + 
+    geom_point() + theme_classic()
+  # scale_colour_brewer(palette="Set1") +
+  # geom_text(aes(label = SampleID )) +  ( add , label=s$SampleID to aes_string if using this)
+
+    
+  if (!is.null(ci)) {
+    res$plot <- res$plot + stat_ellipse(level=ci, linetype=2)
+  }
+  
+  # Run an adonis test, save in result
+  adonis_formula <- formula(paste("distances ~", var))
+  strata_arg <- if (is.null(strata)) NULL else res$df[[strata]]
+  res$test <- adonis(adonis_formula, data=s, strata=strata_arg)
+  
+  # Fix the test results:
+  # Print the actual formula instead of "adonis_formula"
+  # Replace the strata, too, for readability
+  adonis_call <- as.list(res$test$call)
+  adonis_call$formula <- adonis_formula
+  # Have to do some R metaprogramming to make this look right...
+  adonis_call$strata <- if (is.null(strata)) NULL else substitute(s$strata, list(strata=strata))
+  res$test$call <- as.call(adonis_call)
+
+  class(res) <- "pcoa_1way"
+  res
+}
+
+print.pcoa_1way <- function (x) {
+  print(x$plot)
+#  print(x$test)
+}
+```
+
+```{r pcoa_1way_continuous, echo=FALSE}
+#' Perform a PCoA analysis of one variable
+#' @param s The sample table
+#' @param d A distance matrix.  The matrix will be trimmed to include only the samples in `s`.
+#' @param var The variable of interest (string)
+#' @param strata If data is stratified, the name of the column containing the strata
+#' @param ci Confience interval to plot elipse around. NULL if not ploted.
+pcoa_1way_continuous <- function(s, d, var="study_group", strata=NULL, ci=NULL) {
+  # Select columns of interest from distance matrix
+  distances <- dist_subset(d, s$SampleID)
+
+  res <- list()
+  
+  # Run the actual PCoA ordination
+  res$pcoa <- pcoa(distances)
+  
+  # Save distances and sample info back into result
+  res$distances <- distances
+  res$df <- cbind(s, res$pcoa$vectors[,1:3])
+  
+  # Make a simple plot, save in result
+  res$plot <- ggplot(res$df, aes_string(x="Axis.1", y="Axis.2",color=var)) + geom_point() + theme_classic() + scale_colour_gradientn(colours = rainbow(2))
+  
+  if (!is.null(ci)) {
+    res$plot <- res$plot + stat_ellipse(level=ci, linetype=2)
+  }
+  
+  # Run an adonis test, save in result
+  adonis_formula <- formula(paste("distances ~", var))
+  strata_arg <- if (is.null(strata)) NULL else res$df[[strata]]
+  res$test <- adonis(adonis_formula, data=s, strata=strata_arg)
+  
+  # Fix the test results:
+  # Print the actual formula instead of "adonis_formula"
+  # Replace the strata, too, for readability
+  adonis_call <- as.list(res$test$call)
+  adonis_call$formula <- adonis_formula
+  # Have to do some R metaprogramming to make this look right...
+  adonis_call$strata <- if (is.null(strata)) NULL else substitute(s$strata, list(strata=strata))
+  res$test$call <- as.call(adonis_call)
+
+  class(res) <- "pcoa_1way_continuous"
+  res
+}
+
+print.pcoa_1way_continuous <- function (x) {
+  print(x$plot)
+#  print(x$test)
+}
+```
+
+```{r test_taxon_abundance, echo=FALSE}
+#' Test taxa for differences in abundance
+#' @param s A data frame of sample info.
+#' @param cts A matrix of OTU counts (rows) for each sample (columns).
+#' @param g A factor of sample groups to be tested.
+#' @param a A chearacter vector of OTU assignments.
+test_taxon_abundance <- function (s, cts, var="study_group", a=NULL, min_fraction=0.5) {
+  # Limit OTU table to samples in provided data frame
+  cts <- cts[, s$SampleID]
+  cts <- rowsum(cts, as.character(a))
+  
+  # Matrix of OTU proportions
+  props <- sweep(cts, 2, colSums(cts), `/`)
+
+  # Empty result
+  res <- list()
+
+  # Detect OTUs present in < 5 samples
+  frac_present <- function (x) sum(x > 0) / length(x)
+  too_rare <- apply(cts, 1, function (x) frac_present(x) < min_fraction)
+
+  res$tests <- apply(cts[!too_rare,], 1, function (x) kruskal.test(x,s[[var]]))
+
+  medians <- t(apply(props[!too_rare,], 1, tapply, s[[var]], median))
+  colnames(medians) <- paste("Median", colnames(medians))
+  
+  res$df <- data.frame(Taxon = names(res$tests))
+  res$df <- cbind(
+    res$df, 
+    medians,
+    Pval = sapply(res$tests, `[[`, "p.value"))
+  res$df <- within(res$df, {
+    FDR <- p.adjust(Pval, method="fdr")
+  })
+  res$df <- arrange(res$df, Pval)
+  
+  plotdf <- melt(props, varnames=c("Taxon", "SampleID"), value.name="Proportion")
+  plotdf <- merge(plotdf, res$df, by="Taxon", all.x=T, all.y=F)
+  plotdf <- subset(plotdf, FDR < 0.05)
+  plotdf <- merge(plotdf, s, by="SampleID", all.x=T, all.y=F)
+  plotdf$Taxon <- reorder(plotdf$Taxon, plotdf$Pval)
+
+  res$plot <- ggplot(plotdf) + 
+    geom_boxplot(aes_string(x=var, y="Proportion"), coef=200) + theme(text = element_text(size=10),
+        axis.text.x = element_text(angle=90, vjust=1)) +
+    facet_wrap(~ Taxon, scales="free_y", ncol=2) 
+    #theme_classic()
+
+  class(res) <- "taxon_abundance_tests"
+  res
+}
+print.taxon_abundance_tests <- function (x) {
+  print(x$plot)
+  print(subset(x$df, Pval < 0.05))
+}
+```
+
+```{r StatEllipse, echo=FALSE}
+require(proto)
+
+StatEllipse <- proto(ggplot2:::Stat,
+  {
+    required_aes <- c("x", "y")
+    default_geom <- function(.) GeomPath
+  	objname <- "ellipse"
+
+		calculate_groups <- function(., data, scales, ...){
+			.super$calculate_groups(., data, scales,...)
+		}
+		calculate <- function(., data, scales, level = 0.75, segments = 51,...){
+      dfn <- 2
+      dfd <- length(data$x) - 1
+      if (dfd < 3){
+      	ellipse <- rbind(c(NA,NA))	
+      } else {
+          require(MASS)
+          v <- cov.trob(cbind(data$x, data$y))
+          shape <- v$cov
+          center <- v$center
+          radius <- sqrt(dfn * qf(level, dfn, dfd))
+          angles <- (0:segments) * 2 * pi/segments
+          unit.circle <- cbind(cos(angles), sin(angles))
+          ellipse <- t(center + radius * t(unit.circle %*% chol(shape)))
+      }
+    
+      ellipse <- as.data.frame(ellipse)
+      colnames(ellipse) <- c("x","y")
+      return(ellipse)
+		}
+	}
+)
+
+stat_ellipse <- function(mapping=NULL, data=NULL, geom="path", position="identity", ...) {
+  StatEllipse$new(mapping=mapping, data=data, geom=geom, position=position, ...)
+}
+```
+
+## Beta diversity analyses
+
+### Unweighted Unifrac plots, colored by study group
+
+#### All 3 groups at study enrollment (t1)
+
+```{r BetaDiversity_unweighted_overall_plot_t1, fig.height=3, fig.width=4.5, echo=FALSE}
+# Make SubjectID a categorical variable
+s$SubjectID <- as.factor(s$SubjectID)
+
+s_t1 <- subset(s, Age_bin %in% "1")
+
+unw_t1 <- pcoa_1way(s_t1, unw, var="StudyGroup")
+unw_t1$plot + scale_color_manual(values=c("BREASTFED"="red","FORMULA A"="blue","FORMULA B"="green"))
+#theme(legend.direction="horizontal", legend.position="bottom")
+```
+
+#### Formula B vs. Breastfed at final timepoint (t4)
+(no Formula A samples)
+
+```{r BetaDiversity_Weighted_BreastfedFormB_plot_t4, fig.height=3, fig.width=4.5, echo=FALSE}
+sBBr_t4 <- subset(s_t4,!(StudyGroup %in% "FORMULA A"))
+wtu_sBBr_t4 <- pcoa_1way(sBBr_t4, wtu, var="StudyGroup")
+wtu_sBBr_t4$plot + scale_color_manual(values=c("BREASTFED"="red","FORMULA A"="blue","FORMULA B"="green"))
+wdf_sBBr_t4 <- droplevels(wtu_sBBr_t4$df)
+adonis(wtu_sBBr_t4$distances ~ StudyGroup, data=wdf_sBBr_t4)
+```
+## --------------------------------------------
+
+#### Unweighted Unifrac, by subject
+
+```{r BetaDiversity_unweightedplot_bysubject, fig.height=3, fig.width=4.5, echo=FALSE}
+s$Age_bin <- as.factor(s$Age_bin)
+
+pcoa_by_subject <- function(current_subjectID) {
+  s_Br10 <- subset(s, SubjectID %in% current_subjectID)
+  unw_Br10 <- pcoa_1way(s_Br10, unw, var="Age_bin")
+  unw_Br10$plot + scale_color_manual(values=c("1"="red","2"="orange","3"="green","4"="blue")) + labs(title=current_subjectID)
+}
+
+lapply(as.character(unique(s$SubjectID)), pcoa_by_subject)
+```
+
+
+```{r DifferingTaxonAbundance_figure, fig.height=9, echo=FALSE}
+test_taxon_abundance(s, cts, var="StudyGroup", a=a )
+```
+

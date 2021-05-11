@@ -1,0 +1,85 @@
+```{r setup, echo=FALSE}
+#Creates figure image files in Knit folder 
+library(knitr)
+opts_chunk$set(
+  tidy=FALSE,
+  cache=F,
+  echo=F,
+  dpi=100,
+  fig.width=6,
+  fig.path="Knit/figure/",
+  cache.path="Knit/cache/",
+  dev=c("png", "pdf", "postscript"))
+```
+
+```{r load_scripts, echo=FALSE, message=FALSE, warning=FALSE}
+#Load scripts for 16S analysis
+library(qiimer)
+library(pander)
+library(kylemisc)
+library(fossil)
+library(plyr)
+library(dplyr)
+library(gdata)
+```
+
+```{r load_custom, echo=FALSE, message=FALSE, warning=FALSE}
+source(file="../test_OTU_abundance.R")
+source(file="../test_taxon_abundance.R")
+source(file="../1_way_pcoa.R")
+source(file="../rarefaction_diversity.R")
+```
+
+```{r DeNOVO OTU code, echo=FALSE}
+# Assign sample mapping file
+s <- read_qiime_mapping_file("P55_mapping_Rbx_UPenn.txt")
+
+
+# Assign OTU table
+o <- read_qiime_otu_table("otu/classic_otu_table.txt")
+
+# Metadata in the form of truncated green genes assignments
+md <- sub("(; [kpcofgs]__)+$", "", o$metadata, perl=T)
+
+# Assignments data-frame
+adf <- split_assignments(md)
+a <- simplify_assignments(adf)
+
+# Arrange s by StudyGroup, then by SubjectID
+s <- arrange(s, StudyGroup, SubjectID)
+
+# Check for invalid sample IDs
+problem_ids <- setdiff(s$SampleID, colnames(o$counts))
+if (length(problem_ids ) > 0) stop (simpleError(paste("id mismatch found", problem_ids, collapse=" ")))
+```
+
+```{r echo=FALSE}
+# Assignment counts per SampleID
+cts <- o$counts[,s$SampleID]
+s$read_counts <- colSums(cts)
+```
+
+```{r overall_heatmap_annotations, echo=FALSE}
+#ann_colors <- list( Timepoint=c("0h"="red","12h"="orange","24h"="yellow","36h"="blue","48h"="violet","baseline"="pink"))
+annotations <- s[,c("Sample_Type", "Crude_DNA_Picogreen_Value", "Picogreen_Concentration_of_16S_Purified_Products", "read_counts")]
+rownames(annotations) <- s$SampleID
+```
+
+### OTU Heatmap (in associated PDF)
+
+```{r OTU_Heatmap, fig.width=30, fig.height=19, echo=FALSE, render=FALSE}
+otu_heatmap(
+  otu_counts=cts[,s$SampleID],
+  assignments=a,
+  annotation=annotations,
+  threshold=1000,
+  #annotation_colors=ann_colors,
+  color = saturated_rainbow(5000, saturation_limit = 0.4),
+  cluster_cols = FALSE, cluster_rows = FALSE,
+  fontsize_col = 10, fontsize_row = 12, 
+  cellwidth=10, cellheight=12, 
+  file = "MOD_otu_heatmap.pdf"
+)
+```
+
+

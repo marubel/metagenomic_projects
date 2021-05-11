@@ -1,0 +1,378 @@
+---
+title: "Metaphlan-KrakenUniq-16S-Comparison-Cameroon-MAR"
+author: "Arwa Abbas, Meagan Rubel and Louis Taylor"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  dev='svg'
+)
+```
+
+```{r Libraries, include=FALSE}
+library("tidyverse")
+library("magrittr")
+library("taxonomizr")
+library("reshape2")
+library("ggplot2")
+library("eclectic")
+library("pander")
+library("vegan")
+library("ape")
+```
+
+This is an R Markdown that compares V4 and shotgun sequencing data from Camerooninan fecal samples. Analysis platforms compared consist of the following: 
+
+1) [Kraken Uniq](https://github.com/fbreitwieser/krakenuniq) using the database of bacterial, archaeal, viral, protozoan, fungal, and helminth sequences downloaded from NCBI nr/nt collection by Arwa in December 2018. This workflow was done using [sunbeam](https://github.com/sunbeam-labs/sunbeam) using the [Kraken Uniq extension](https://github.com/ArwaAbbas/sbx_kraken_uniq).
+
+2) [QIIME2](https://qiime2.org), a microbiome analysis package designed for bacterial amplicon (here, V4) sequence analysis, which used the Greengenes 16S rRNA marker gene reference database (version 13_8).
+
+3) [MetaPhlAn2](https://bitbucket.org/biobakery/metaphlan2), a database of bacterial, archaeal, viral, and eukaryotic clade-specific marker genes. This workflow was done using [sunbeam](https://github.com/sunbeam-labs/sunbeam) using the [MetaPhlAn2 extension](https://github.com/louiejtaylor/sbx_metaphlan).
+
+
+```{r Read Kraken files}
+read_kraken_files <- function(filename) {
+                              x = read.delim(filename, comment.char="#",
+                                             stringsAsFactors = FALSE)
+                              samplename = gsub("-reports.tsv", "",filename)
+                              x$V10 = samplename
+                              return(x)
+                        }
+```
+
+```{r Plotting}
+#Boxplots
+theme_aa_boxplot <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+#Heatmap
+theme_aa_heatmap <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background.x = element_rect(fill = "white", color = "black"),
+        strip.background.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank())
+#Barchart
+theme_aa_bars <- theme_bw(base_size = 12) +
+  theme(panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = rel(1.1)),
+        axis.ticks.x = element_blank())
+
+#Scatterplot
+theme_aa_scatter <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"),
+        axis.text = element_text(size = rel(1.1), color = "black"),
+        axis.title = element_text(size = rel(1.1)))
+
+#Kind of crazy, but these need to be in the exact same order as they would be as factors in the dataframe.
+ethnic_cols <-c("Bagyeli" = "#a9315c",
+                "Baka" = "#f58aa5",
+                "Bantu" = "#ffcc99", 
+                "Mbororo_Fulani" = "#999FFF")
+ANTS_shapes <- c("Neg" = 2,
+                 "Pos" = 17)
+
+```
+
+```{r Kraken annotation}
+#Cameroon files
+kraken_files <- list.files(path = "/media/THING2/louis/15_RubelCameroonShotgun/01_CameroonShotgun/sunbeam_output/classify/kraken_uniq/report",
+                           pattern = glob2rx("*.tsv"),
+                           full.names = TRUE)
+
+#Exclude the empty files. Feel like there should be a more elegant way to avoid these.
+kraken_files <- kraken_files[grep(pattern = "D0023-reports.tsv", kraken_files, 
+                                  invert = TRUE)]
+kraken_files <- kraken_files[grep(pattern = "D0041-reports.tsv", kraken_files, 
+                                  invert = TRUE)]
+
+kraken_dfs <- lapply(kraken_files, read_kraken_files)
+
+classify_df <- do.call(rbind, kraken_dfs)
+
+colnames(classify_df) <-c("PercentReads", 
+                          "CladeNumberReads",
+                          "TaxonNumberReads",
+                          "Kmers","Dup", "Coverage", 
+                          "TaxID", "Rank",
+                          "Name", "Sample")
+
+classify_df$Sample <- gsub("/media/THING2/louis/15_RubelCameroonShotgun/01_CameroonShotgun/sunbeam_output/classify/kraken_uniq/report/", 
+                           "", 
+                           classify_df$Sample)
+
+#Clean up
+rm(kraken_files)
+rm(kraken_dfs)
+
+```
+
+```{r Metadata for Kraken-Uniq and Shotgun}
+#Only want the shotgun samples
+meta_df <- read.delim("/media/THING2/louis/15_RubelCameroonShotgun/00_Metadata/Shotgun_FULL_CM_metadata_102918.txt", stringsAsFactors=FALSE) %$%
+  dplyr::mutate(., sampleID = gsub(pattern = "Shotgun_", replacement = "", sampleID)) %>%
+  dplyr::filter(sampleID %in% unique(classify_df$Sample)) %>%
+  droplevels.data.frame()
+
+```
+
+```{r V4 16S}
+#Only include samples with shotgun information
+V4_prop_data <- read.csv("/media/lorax/users/marubel/EXPORTED-FEATURE-TABLE/V4_Proportional_ASV.csv", stringsAsFactors=FALSE)
+
+V4_prop_data <- V4_prop_data[, colnames(V4_prop_data) %in% c(meta_df$sampleID, "X")]
+
+```
+
+```{r Metaphlan annotation}
+taxonomic_assignments <- read_delim("/media/THING2/louis/15_RubelCameroonShotgun/03_Analyses/CameroonShotgun/Metaphlan_Summary/metaphlan/taxonomic_assignments.tsv", "\t", escape_double = FALSE, trim_ws = TRUE)
+
+```
+
+```{r Find the missing samples, eval=FALSE, include=FALSE}
+#Find the samples that have been analyzed by shotgun sequencing but are not in metadata
+setdiff(classify_df$Sample, meta_df$sampleID)
+
+```
+
+```{r Total non-viral reads classified}
+bae_reads <- classify_df %>% 
+  dplyr::filter(., Rank == "superkingdom") %$% 
+  .[grep(c("*Viruses"),Name, invert = TRUE),] %>%
+  group_by(Sample) %>%
+  summarise(TotalBAEReads = sum(CladeNumberReads))
+
+```
+
+```{r Genera detected, cache = TRUE}
+#Obtain taxonomic information from TaxaID
+bae_taxa_df <- classify_df %>% 
+  dplyr::filter(., Rank == "genus") %$%
+  #Remove viruses
+  .[grep(c("*virus"),Name, invert = TRUE),] %>%
+  droplevels.data.frame() %$%
+  getTaxonomy(unique(TaxID),taxaNodes,taxaNames) %>%
+  as.data.frame() %>%
+  dplyr::mutate(., TaxID = rownames(.)) %$%
+  dplyr::mutate(., TaxID = as.factor(trimws(TaxID, which = "both")))
+  
+#Subset data frame for hits to bacterial genera.
+bae_g_df <- merge(classify_df, bae_taxa_df, by = "TaxID", 
+                             all.x = FALSE) %>%
+  dplyr::filter(., Rank == "genus")
+ 
+```
+
+### Relative abundances of relevant taxa in shotgun metagenomic and V4 region 16S sequencing. 
+
+Meagan's genera of interest:  
+1. Bacteroides  
+2. Prevotella  
+3. Treponema  
+4. Klebsiella 
+
+```{r Average relative abundance in each subsistence group shotgun}
+genera_shot <- c("Bacteroides", "Prevotella", "Treponema", "Klebsiella")
+
+#Non-rarefied data
+bae_g_df %>% 
+  select(c("Sample", "CladeNumberReads", "genus")) %$%
+  merge(., bae_reads, by = "Sample") %>% 
+  dplyr::mutate(prop = (CladeNumberReads/TotalBAEReads)) %>% 
+  dplyr::filter(genus %in% genera_shot) %$%
+  merge(., meta_df[, c("sampleID", "Ethnicity")], 
+        by.x = "Sample", by.y = "sampleID") %$% 
+  drop_na(., Ethnicity) %>%
+  group_by(Ethnicity, genus) %>%
+  summarise(RelativeProportion = mean(prop)) %>%
+  pander(caption = "Relative Abundance of 4 Genera in\nHunter Gatherer Populations (shotgun)")
+
+```
+
+```{r Average relative abundance in each subsistence group 16S}
+genera_V4 <- c("g__Bacteroides", "g__Prevotella", "g__Treponema", "g__Klebsiella")
+
+dplyr::filter(V4_prop_data, grepl(paste(genera_V4, collapse="|"), X, fixed = FALSE)) %>%
+  reshape2::melt() %$%
+  merge(., meta_df[, c("sampleID", "Ethnicity")], 
+        by.x = "variable", by.y = "sampleID") %$% 
+  drop_na(., Ethnicity) %>%
+  group_by(Ethnicity, X) %>%
+  summarise(RelativeProportion = mean(value)) %>%
+  pander(caption = "Relative Abundance of 4 Genera in\nHunter Gatherer Populations (16S)")
+
+#Transform metaphlan counts in taxonomics_assignments to proportions
+#taxonomic_assignments.tsv is like summed_cts
+#transform taxonomic_assignments into proportions: 
+#read in taxonomic_assignments.tsv with first column as double "term" and all others (~_review) as numeric()
+```
+```{r Average relative abundance in each subsistence group Metaphlan}
+metaphlan_otus <- taxonomic_assignments$Term #Just a list of metaphlan OTUs, no count/sample data
+test_metaphlan <- taxonomic_assignments %$%
+  as.data.frame(t(.[,-1]))
+colnames(test_metaphlan) <- metaphlan_otus #Produces rows as sample ID and columns as taxonomic assignments
+test_metaphlan <- tibble::rownames_to_column(test_metaphlan, "rows") %>%
+  dplyr::filter(unclassified < 100) %>%
+  tibble::column_to_rownames("rows") #makes rows samples and columns as taxonomic assignments, filters unclassified --THIS IS ALREADY PROPORTIONAL! 1-100
+
+test_metaphlan <- sweep(test_metaphlan, 2, colSums(test_metaphlan), "/") #now 0-1 proportions
+metaphlan_prop <- t(test_metaphlan) %>% as.data.frame()
+
+
+#change all colnames to remove _review
+
+colnames(metaphlan_prop) <- c("D1069", "D0632", "D0538", "D0385", "D0580", "D0154", "D1234", "D0585", "D1134", "D0020", "D0457", "D1099", "D0569", "D0134", "D0397", "D1195", "D0023", "D1215", "D1142", "D0225", "D0124", "D0038", "D0031", "D0056", "D0009", "D0576", "D1183", "D0563", "D1050", "D0865", "D1149", "D0587", "D0792", "D0572", "D1140", "D0524", "D0433", "D1052", "D0892", "D1185", "D0065", "D0410", "D0899", "D0450", "D0233", "D0181", "D0571", "D0907", "D0144", "D0653", "D0588", "D0908", "D0990", "D1261", "D0480", "D0575", "D0736", "D1115", "D0527", "D0490", "D0633", "D0025", "D0169", "D1067", "D1188", "D0388", "D0550", "D0226", "D0149", "D0909", "D0150", "D0596", "D1001", "D0939", "D0040", "D0705", "D0914", "D0456", "D0211", "D0644", "D0143", "D0956", "D0474", "D0948", "D1207", "D0651", "D1105", "D0557", "D0624", "D0706", "D1060", "D0299", "D0301", "D0076", "D0041", "D0109", "D0137", "D1164", "D1156", "D1222", "D0608", "D0477", "D0911", "D0105", "D0042", "D0492", "D0417", "D1220", "D1064", "D0509", "D0552", "D0788", "D0235", "D0080", "D1045", "D0741", "D0919", "D0621", "D0424", "D1130", "D0018", "D1137", "D0021", "D0728", "D0247", "D0713", "D1167", "D1292", "D0470", "D0502", "D0475", "D1174", "D1159", "D1187", "D0032", "D1157", "D0626", "D0634", "EB119", "D1297", "D0582", "D0228", "D0950", "D1131", "D0015", "D0447", "D0286", "D0599", "D0574", "D1223", "D0162", "D0611", "D1143", "D0941", "D0623", "D0231", "D0533", "D0060", "D0517", "D0564", "D0202", "D0125", "D1246", "D0916", "EB3","D1178", "D1184", "D1145", "D0478", "D0646", "D0718", "D0617", "D0294", "D0567", "D0412", "D0463", "D1176", "D1236", "D0418", "D0386")
+
+metaphlan_prop <- metaphlan_prop %>% rownames_to_column("X")
+metaphlan_prop_test <- metaphlan_prop
+metaphlan_prop_test$X <- gsub(".*g__Bacteroides.*", "g__Bacteroides", metaphlan_prop$X, fixed= FALSE, perl = TRUE)
+metaphlan_prop_test$X <- gsub(".*g__Prevotella.*", "g__Prevotella", metaphlan_prop_test$X, fixed= FALSE, perl = TRUE)
+metaphlan_prop_test$X <- gsub(".*g__Treponema.*", "g__Treponema", metaphlan_prop_test$X, fixed= FALSE, perl = TRUE)
+metaphlan_prop_test$X <- gsub(".*g__Klebsiella.*", "g__Klebsiella", metaphlan_prop_test$X, fixed= FALSE, perl = TRUE)
+
+genera_met <- c("g__Bacteroides", "g__Prevotella", "g__Treponema", "g__Klebsiella")
+
+#dplyr::filter(metaphlan_prop_test, grepl(paste(genera_met, collapse="|g__"), X, fixed = FALSE)) %>%
+dplyr::filter(metaphlan_prop_test, X %in% genera_met) %>%
+  reshape2::melt() %>% 
+  group_by(X, variable) %>% 
+  summarise(value = sum(value)) %>%
+  merge(., meta_df[, c("sampleID", "Ethnicity")], 
+        by.x = "variable", by.y = "sampleID") %$% 
+  drop_na(., Ethnicity) %>%
+  group_by(Ethnicity, X) %>%
+  summarise(RelativeProportion = mean(value)) %>%
+  pander(caption = "Relative Abundance of 4 Genera in\nHunter Gatherer Populations (MetaPhlan)")
+
+```
+
+```{r Comparing 16S and Kraken-Uniq data for each sample, fig.height=5, fig.width=10}
+
+#Non-rarefied shotgun data
+shotgun_df <-bae_g_df %>% 
+  select(c("Sample", "CladeNumberReads", "genus")) %$%
+  merge(., bae_reads, by = "Sample") %>% 
+  dplyr::mutate(prop = (CladeNumberReads/TotalBAEReads)) %>% 
+  dplyr::filter(genus %in% genera_shot) %$%
+  merge(., meta_df[, c("sampleID", "Ethnicity")], 
+        by.x = "Sample", by.y = "sampleID") %$% 
+  drop_na(., Ethnicity) %>%
+  dplyr::select(-c("CladeNumberReads", "TotalBAEReads"))
+
+V4_df <- dplyr::filter(V4_prop_data, 
+                       grepl(paste(genera_V4, collapse="|"), X, fixed = FALSE)) %>%
+  reshape2::melt() %$%
+  dplyr::mutate(., genus = ifelse(X == "p__Bacteroidetes g__Bacteroides", 
+                               "Bacteroides", ifelse(X == "p__Bacteroidetes g__Prevotella", 
+                                                     "Prevotella", 
+                                                     ifelse(X == "p__Proteobacteria g__Klebsiella", 
+                                                            "Klebsiella", "Treponema")))) %>%
+  dplyr::select(-c("X"))
+
+
+metaphlan_df <- dplyr::filter(metaphlan_prop_test, 
+                       grepl(paste(genera_met, collapse="|"), X, fixed = FALSE)) %>%
+  reshape2::melt() %$%
+  dplyr::mutate(., genus = ifelse(X == "g__Bacteroides", 
+                               "Bacteroides", ifelse(X == "g__Prevotella", 
+                                                     "Prevotella", 
+                                                     ifelse(X == "g__Klebsiella", 
+                                                            "Klebsiella", "Treponema")))) %>%
+
+  
+  dplyr::group_by(variable, genus) %>% 
+  summarise(value = sum(value)) %>%
+  merge(., meta_df[, c("sampleID", "Ethnicity")], 
+        by.x = "variable", by.y = "sampleID") %$% 
+  drop_na(., Ethnicity) 
+
+
+
+#Combine and visualize
+#Prop represents shotgun relative abundance value
+#Value represents V4 relative abundance value
+merge(shotgun_df, V4_df, by.x = c("Sample", "genus"), 
+      by.y = c("variable", "genus")) %>%
+  ggplot(data = ., aes(x = prop, y = value, color = Ethnicity)) + 
+  geom_point() +
+  scale_color_manual(values = ethnic_cols) +
+  facet_grid(~ genus) +
+  labs(x= "Proportion (Kraken-Uniq)", y = "Proportion (V4 16S)") +
+  theme_bw(base_size = 14)+ 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+```
+
+```{r Comparing 16S and Metaphlan data for each sample, fig.height=5, fig.width=10}
+
+merge(metaphlan_df, V4_df, by.x = c("variable", "genus"), 
+      by.y = c("variable", "genus")) %>%
+  ggplot(data = ., aes(x = value.x, y = value.y, color = Ethnicity)) + 
+  geom_point() +
+  scale_color_manual(values = ethnic_cols) +
+  facet_grid(~ genus) +
+  labs(x= "Proportion (MetaPhlAn2)", y = "Proportion (V4 16S)") +
+  theme_bw(base_size = 14)+ 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+```
+
+```{r Comparing Metaphlan and Kraken Uniq data for each sample, fig.height=5, fig.width=10}
+merge(metaphlan_df, shotgun_df, by.x = c("variable", "genus", "Ethnicity"), 
+      by.y = c("Sample", "genus", "Ethnicity")) %>%
+  ggplot(data = ., aes(x = value, y = prop, color = Ethnicity)) + 
+  geom_point() +
+  scale_color_manual(values = ethnic_cols) +
+  facet_grid(~ genus) +
+  labs(x= "Proportion (MetaPhlAn2)", y = "Proportion (Kraken-Uniq)") +
+  theme_bw(base_size = 14)+ 
+  theme(axis.text = element_text(color = "black"), 
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "white", color = "black"))
+
+
+#Clean up
+rm(shotgun_df)
+rm(metaphlan_df)
+rm(V4_df)
+rm(genera_shot)
+rm(genera_V4)
+
+```
+
+```{r Find Bacteroides or Prevotella high samples for KEGG testing from Kraken-Uniq}
+
+prev_high <- subset(shotgun_df, genus =='Prevotella')
+prev_high[which.max(prev_high$prop),]
+
+bact_high <- subset(shotgun_df, genus == 'Bacteroides')
+bact_high[which.max(prev_high$prop),]
+
+sort(bact_high$prop, decreasing = TRUE) 
+grep('0.71264658', bact_high$prop)
+prev_high$Sample[110]
+
+
+```
+
+
+
+
+
